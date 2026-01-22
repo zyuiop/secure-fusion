@@ -1,0 +1,6 @@
+[build]
+rustflags = [
+    # "-C", "force-frame-pointers=yes",
+    "-C", "target-cpu=native",
+    # "-C", "symbol-mangling-version=v0"
+]

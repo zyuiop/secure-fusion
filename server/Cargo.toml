@@ -1,0 +1,36 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+log  = { workspace = true }
+env_logger = "0.11.8"
+proxy = { path = "../proxy" }
+common = { path = "../common", features = [] }
+crypto = { path = "../crypto" }
+chacha20poly1305 = { version = "0.11.0-rc.0", features = ["zeroize"] }
+
+mysql-frontend = { path = "../frontends/mysql" }
+mysql-backend = { path = "../backends/mysql" }
+async-trait = "0.1.88"
+
+tikv-jemallocator = { version = "0.6.1", optional = true }
+snmalloc-rs = { version = "0.3.8", optional = true }
+
+serde = "1.0.228"
+toml = { version = "0.9.8", features = ["serde"] }
+
+[features]
+default = ["snmalloc", "tpcc", "crypto/decrypt-array-in-place"]
+df-trace = ["proxy/df-trace"]
+profile = ["common/profile", "proxy/profile", "mysql-frontend/log_queries", "proxy/debug-plans", "mysql-backend/log-outgoing-queries"]
+jemalloc = ["dep:tikv-jemallocator"]
+snmalloc = ["dep:snmalloc-rs"]
+
+tpcc = ["mysql-backend/ident-normalization"]
+hotcrp = ["mysql-backend/default-encrypt"]
+
+[lints]
+workspace = true

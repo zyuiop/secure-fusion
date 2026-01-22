@@ -1,0 +1,46 @@
+[package]
+name = "mysql-backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mysql_async = { workspace = true, features = ["chrono", "time"] }
+mysql_common = { workspace = true, features = ["chrono", "time", "rust_decimal", "bigdecimal"] }
+rust_decimal = "1.37.1" # same version as in mysql_common
+datafusion = { workspace = true, features = ["backtrace"] }
+log = { workspace = true }
+datafusion-table-providers = { version = "0.8.2", default-features = false, features = ["mysql"], optional = true }
+
+async-trait = "0.1.88"
+futures-util = "0.3.31"
+common = { path = "../../common"}
+crypto = { path = "../../crypto"}
+hybrid-array = { workspace = true }
+hex = { workspace = true }
+bytes = { workspace = true }
+uuid = { version = "1.18.1", features = ["v7"] }
+base64 = "0.22.1"
+
+# For metadata serialization (temporary?)
+serde = "1.0.228"
+toml = { version = "0.9.8", features = ["serde"] }
+rkyv = { workspace = true }
+zerocopy = "0.8.31"
+bincode = { version = "2.0.1", features = ["derive"] }
+rand = "0.10.0-rc.5"
+
+bitflags = { version = "2.9.1", features = ["serde"] }
+
+tokio = "1.48.0"
+rustc-hash = { workspace = true }
+async-stream = "0.3.6"
+
+[features]
+default = []
+log-outgoing-queries = []
+old-scan-converter = ["dep:datafusion-table-providers"]
+ident-normalization = []
+default-encrypt = []
+
+[lints]
+workspace = true

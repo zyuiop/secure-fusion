@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = ["backends/mysql", "common", "frontends/mysql", "proxy", "protocols/mysql", "server", "crypto", "tools/benchmarks"]
+
+[workspace.dependencies]
+datafusion = { version = "51.0.0", features = ["nested_expressions",
+    "crypto_expressions",
+    "datetime_expressions",
+    "encoding_expressions",
+    "regex_expressions",
+    "string_expressions",
+    "unicode_expressions",
+    "compression",
+    "recursive_protection",
+    "sql",
+    "serde"], default-features = false }
+arrow-schema = { version = "57.0.0", features = ["serde"] }
+futures = "0.3.31"
+futures-util = "0.3.31"
+async-trait = "0.1.88"
+
+tokio = { version = "1.46.1", features = ["full"] }
+tokio-util = { version = "0.7.17", features = ["full"] }
+
+num_enum = "0.7.4"
+log = "0.4.27"
+
+mysql_async = { version = "0.36.1" }
+mysql_common = { version = "0.35.4" }
+
+bytes = "1.10.1"
+
+hybrid-array = "0.3.0"
+hex = "0.4.3"
+rustc-hash = "2.1.1"
+nohash-hasher = "0.2.0"
+rkyv = "0.8.12"
+
+[patch.crates-io]
+sqlparser = { git = 'https://github.com/zyuiop/datafusion-sqlparser-rs', branch = "patched-v0.59.0" }
+datafusion = { git = 'https://github.com/zyuiop/datafusion', branch = "patched-v51.0.0" }
+
+[profile.release]
+# For a slight performance boost (+15%) at the cost of a 8mn compile time :D
+lto = "fat"
+codegen-units = 1
+
+
+# For benchmarking
+# debug = "line-tables-only"
+# debug = 1
+
+# https://doc.rust-lang.org/rustc/profile-guided-optimization.html
+
+[workspace.lints.clippy]
+perf = "deny"
+disallowed-types = { level = "deny" }
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+unreachable_code = "deny"
+unreachable_patterns = "deny"
+unused_imports = "deny"
+dead_code = "deny"
+irrefutable_let_patterns = "deny"
+unused_unsafe = "deny"
+unused_mut = "deny"
+unused_variables = "deny"
+
+unused_lifetimes = "warn"
+redundant_lifetimes = "warn"
+
+
+
+#![warn(unused_lifetimes, redundant_lifetimes)]
+#![deny(clippy::perf)]

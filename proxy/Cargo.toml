@@ -1,0 +1,25 @@
+[package]
+name = "proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+log = { workspace = true }
+datafusion = { workspace = true }
+common = { path = "../common" }
+crypto = { path = "../crypto" }
+
+# Crypto libraries
+async-trait = "0.1.88"
+hex = "0.4.3"
+futures = "0.3.31"
+rustc-hash = { workspace = true }
+nohash-hasher = { workspace = true }
+
+[features]
+df-trace = []
+profile = ["common/profile"]
+debug-plans = []
+
+[lints]
+workspace = true

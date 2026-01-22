@@ -1,0 +1,18 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+datafusion = { workspace = true }
+strum = "0.27.1"
+strum_macros = "0.27.1"
+async-trait = { workspace = true }
+log = "0.4.27"
+rustc-hash = { workspace = true }
+
+[features]
+profile = []
+
+[lints]
+workspace = true

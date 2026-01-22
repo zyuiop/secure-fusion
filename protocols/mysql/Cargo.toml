@@ -1,0 +1,13 @@
+[package]
+name = "mysql-interop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../../common" }
+mysql_common = { workspace = true }
+bytes = { workspace = true }
+num_enum = { workspace = true }
+
+[lints]
+workspace = true
