@@ -53,7 +53,7 @@ impl ExecutionPlan for DdlPlan {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.base.properties()
     }
 
@@ -105,7 +105,14 @@ impl ExecutionPlan for DdlPlan {
         Ok(Box::pin(result))
     }
 
-    fn statistics(&self) -> datafusion::common::Result<Statistics> {
-        Ok(Statistics::default().with_num_rows(Precision::Exact(0)))
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion::common::Result<Statistics> {
+        if partition.is_some() {
+            Ok(Statistics::new_unknown(self.schema().as_ref()))
+        } else {
+            Ok(Statistics::default().with_num_rows(Precision::Exact(0)))
+        }
     }
 }

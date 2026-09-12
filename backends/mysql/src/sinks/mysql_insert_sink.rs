@@ -1,13 +1,13 @@
 use crate::planning::logical::DUPLICATE_VALUE_PFX;
 use crate::sinks::mysql_dml_sink::MySqlDmlSink;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::ResolvedTableReference;
 use datafusion::logical_expr::WriteOp;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::sql::TableReference;
 
 impl MySqlDmlSink {
     pub(crate) fn insert(
-        target_table: TableReference,
+        target_table: ResolvedTableReference,
         insert_op: InsertOp,
         insert_schema: SchemaRef,
     ) -> Self {
@@ -51,7 +51,10 @@ impl MySqlDmlSink {
             format!(" ON DUPLICATE KEY UPDATE {on_duplicate_set}")
         };
 
-        let query = format!(r#"{verb} {target_table} SET {insert_set}{on_duplicate}"#,);
+        let query = format!(
+            r#"{verb} {}.{} SET {insert_set}{on_duplicate}"#,
+            target_table.schema, target_table.table
+        );
         log::trace!("Insert query: {query}");
 
         Self {

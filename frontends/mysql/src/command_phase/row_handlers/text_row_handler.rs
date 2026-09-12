@@ -214,8 +214,10 @@ impl<'a> DisplayIndex for BooleanDisplayIndex<'a> {
 }
 
 // TODO: add timestamp format to options
-const FORMAT_OPTIONS: FormatOptions =
-    FormatOptions::new().with_timestamp_format(Some("%Y-%m-%d %H:%M:%S%.3f"));
+const FORMAT_OPTIONS: FormatOptions = FormatOptions::new()
+    .with_timestamp_format(Some("%Y-%m-%d %H:%M:%S%.3f"))
+    .with_timestamp_tz_format(Some("%Y-%m-%d %H:%M:%S%.3f"))
+    .with_datetime_format(Some("%Y-%m-%d %H:%M:%S%.3f"));
 // .with_timestamp_format()
 
 fn build_serializer<'a>(arr: &'a ArrayRef) -> Box<dyn TextColumnSerializer + 'a> {

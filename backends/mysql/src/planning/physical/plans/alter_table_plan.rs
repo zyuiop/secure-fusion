@@ -17,7 +17,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::sql::sqlparser::ast::{AlterTableOperation, Statement};
+use datafusion::sql::sqlparser::ast::{AlterTable, AlterTableOperation, Statement};
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan};
 use std::fmt::Debug;
 use std::iter::once;
@@ -49,16 +49,16 @@ impl AlterTablePlan {
         resolved_table_reference: &ResolvedTableReference,
         operations: Vec<AlterTableOperation>,
     ) -> Statement {
-        Statement::AlterTable {
+        Statement::AlterTable(AlterTable {
             operations,
             name: object_name_from_resolved(resolved_table_reference),
             if_exists: false,
-            iceberg: false,
             location: None,
             only: false,
             on_cluster: None,
+            table_type: None,
             end_token: AttachedToken(TokenWithSpan::wrap(Token::EOF)),
-        }
+        })
     }
 
     pub fn new_plan(

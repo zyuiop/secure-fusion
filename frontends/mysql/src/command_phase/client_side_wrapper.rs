@@ -71,7 +71,7 @@ impl<T: ProxyImplementation> ClientHelper for ClientWrapper<T> {
     }
 }
 
-const LONG_QUERY_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(33);
+const LONG_QUERY_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl<T: ProxyImplementation> ClientWrapper<T> {
     pub(crate) fn new(
@@ -92,7 +92,7 @@ impl<T: ProxyImplementation> ClientWrapper<T> {
 
     pub(crate) async fn read_handle_next_command(&mut self) -> HandleResult {
         coz::begin!("read_handle_next_command");
-        let Some(pack) = profile!("read_packet", self.client.read()) else {
+        let Some(pack) = self.client.read() else {
             return HandleResult::ConnectionClosed {
                 reason: "closed by peer".to_string(),
             };
@@ -122,7 +122,7 @@ impl<T: ProxyImplementation> ClientWrapper<T> {
             Ok(closed) => closed,
             Err(e) => {
                 error!(
-                    "[{}] An error occurred in the proxy while handling user command: {e:?}",
+                    "[{}] An error occurred in the proxy while handling user command: {e}",
                     self.client.peer_addr()
                 );
                 self.handle_error(e.into());
@@ -317,6 +317,7 @@ impl<T: ProxyImplementation> ClientWrapper<T> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     async fn handle_query(&mut self, query: &str) -> CommandPhaseResult<()> {
         #[cfg(feature = "log_queries")]
         log::info!("Q: {}", query);

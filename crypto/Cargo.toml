@@ -7,32 +7,45 @@ edition = "2024"
 log = { workspace = true }
 hybrid-array = { workspace = true }
 hex = { workspace = true }
-futures-util = { workspace = true }
-async-trait = { workspace = true }
 
-hkdf = "0.13.0-rc.0"
-sha2 = "=0.11.0-rc.0"
-aead = { version = "0.6.0-rc.0", features = ["alloc", "bytes"] }
-rand_core = "0.9.3"
-rand = "0.9.2"
-bytes = { workspace = true }
-
-base64 = "0.22.1"
+hkdf = "0.13.0"
+sha2 = "0.11.0"
+aead = { version = "0.6.0-rc.10", features = ["alloc", "bytes"] }
+rand = { workspace = true }
+serde = { version = "1.0.228", features = ["derive"] }
 
 datafusion = { workspace = true }
 common = { path = "../common" }
 
-bincode = { version = "2.0.1", features = ["derive"] }
 zerocopy = "0.8.27"
 
-# Ideally temporary, used only for the kw_search implem
-chacha20poly1305 = { version = "0.11.0-rc.0", features = ["zeroize"] }
-half = { version = "2.6.0", features = ["zerocopy"] }
 rustc-hash = { workspace = true }
-getrandom = "0.4.0-rc.0"
+
+chacha20poly1305 = { version = "0.11.0-rc.3", features = ["reduced-round"], optional = true }
+aes-gcm = { version = "0.11.0-rc.3", optional = true }
+aws-lc-rs = { version = "1.16.3", optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8.2" }
+snmalloc-rs = "0.7.4"
+ccm = "0.6.0-rc.3"
+deoxys = "0.2.0-rc.3"
+eax = "0.6.0-rc.3"
+
 
 [features]
-decrypt-array-in-place = []
+default = ["crypto_all"]
+
+crypto_all = ["rustcrypto_aes", "rustcrypto_chacha", "crypto_aws_lc"]
+rustcrypto_aes = ["dep:aes-gcm"]
+rustcrypto_chacha = ["dep:chacha20poly1305"]
+crypto_aws_lc = ["dep:aws-lc-rs"]
+tracing = []
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "crypto_compare"
+harness = false

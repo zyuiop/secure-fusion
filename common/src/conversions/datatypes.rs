@@ -6,9 +6,11 @@ use datafusion::arrow::datatypes::{
     DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE,
     DataType, Field, IntervalUnit, Schema, TimeUnit,
 };
-use datafusion::common::not_impl_err;
+use datafusion::common::{not_impl_datafusion_err, not_impl_err};
 use datafusion::sql::sqlparser::ast;
-use datafusion::sql::sqlparser::ast::{BinaryLength, ColumnDef, ExactNumberInfo, TimezoneInfo};
+use datafusion::sql::sqlparser::ast::{
+    ArrayElemTypeDef, BinaryLength, ColumnDef, ExactNumberInfo, TimezoneInfo,
+};
 
 impl ArrowDatatypeConverter {
     /// Taken and upgraded from DataFusion [datafusion::sql::planner::SqlToRel]
@@ -119,7 +121,7 @@ impl ArrowDatatypeConverter {
             | ast::DataType::UInt32
             | ast::DataType::Int4Unsigned(_) => Ok(DataType::UInt32),
 
-            ast::DataType::Timestamp(_, _) | ast::DataType::Datetime(_) => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)), // MySQL only supports micro-second precision
+            ast::DataType::Timestamp(_, _) | ast::DataType::Datetime(_) => Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("+00".into()))), // MySQL only supports micro-second precision
             ast::DataType::Date => Ok(DataType::Date32),
             ast::DataType::Time(None, tz_info) => {
                 if matches!(tz_info, TimezoneInfo::None)
@@ -168,8 +170,33 @@ impl ArrowDatatypeConverter {
                 ))
             }
 
+            ast::DataType::Array(ArrayElemTypeDef::AngleBracket(dt)) => {
+                let underlying = self.convert_data_type(dt.as_ref())?;
+                Ok(DataType::new_list(underlying, false))
+            }
+
+            ast::DataType::Custom(on, args) => {
+                let Some(name) = on.0[0].as_ident() else {
+                    not_impl_err!("Unsupported custom SQL type {on:?}")?
+                };
+
+                let name = name.value.to_lowercase();
+
+                match name.as_str() {
+                    "f32_vector" => {
+                        if let Some(len) = args.get(0) {
+                            let len: i32 = len.parse().map_err(|_| not_impl_datafusion_err!("f32_vector argument must be an integer if present"))?;
+                            Ok(DataType::new_fixed_size_list(DataType::Float32, len, false))
+                        } else {
+                            Ok(DataType::new_list(DataType::Float32, false))
+                        }
+                    }
+                    other =>
+                        not_impl_err!("Unsupported custom SQL type {other}")?
+                }
+            }
+
             ast::DataType::Regclass
-            | ast::DataType::Custom(_, _)
             | ast::DataType::Array(_)
             | ast::DataType::Unspecified
             | ast::DataType::Datetime64(_, _)
@@ -189,7 +216,7 @@ impl ArrowDatatypeConverter {
             | ast::DataType::Int128
             | ast::DataType::Int256
             | ast::DataType::UInt128
-            | ast::DataType::TimestampNtz
+            | ast::DataType::TimestampNtz(_)
             | ast::DataType::TsVector
             | ast::DataType::TsQuery
             | ast::DataType::HugeInt

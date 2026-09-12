@@ -1,15 +1,84 @@
-use crate::arrow::cast_to_binary;
+use crate::arrow::encode_columnar_value_to_binary;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Schema};
-use datafusion::common::{DataFusionError, ScalarValue};
-use datafusion::logical_expr::ColumnarValue;
+use datafusion::common::{DataFusionError, exec_datafusion_err, plan_err};
 use datafusion::logical_expr::interval_arithmetic::Interval;
+use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::statistics::Distribution;
+use datafusion::logical_expr::{
+    ColumnarValue, Expr, ExprSchemable, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    Volatility,
+};
 use datafusion::physical_plan::PhysicalExpr;
 use std::any::Any;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct ToBinaryUdf {
+    signature: Signature,
+}
+
+impl ToBinaryUdf {
+    pub fn udf() -> ScalarUDF {
+        ScalarUDF::new_from_impl(Self::default())
+    }
+}
+
+impl Default for ToBinaryUdf {
+    fn default() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ToBinaryUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "to_binary"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> datafusion::common::Result<DataType> {
+        Ok(DataType::Binary)
+    }
+
+    fn invoke_with_args(
+        &self,
+        mut args: ScalarFunctionArgs,
+    ) -> datafusion::common::Result<ColumnarValue> {
+        let arg = args.args.pop().ok_or(exec_datafusion_err!(
+            "missing argument for to_binary function"
+        ))?;
+
+        encode_columnar_value_to_binary(arg)
+    }
+
+    fn simplify(
+        &self,
+        mut args: Vec<Expr>,
+        info: &SimplifyContext,
+    ) -> datafusion::common::Result<ExprSimplifyResult> {
+        if args.len() != 1 {
+            plan_err!("invalid arguments for {}", self.name())?;
+        }
+
+        if args[0].get_type(info.schema())? == DataType::Binary {
+            // If the return-type of the argument is already a binary, this function is a no-op
+            Ok(ExprSimplifyResult::Simplified(args.pop().unwrap()))
+        } else {
+            Ok(ExprSimplifyResult::Original(args))
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ToBinaryExpr {
@@ -61,18 +130,7 @@ impl PhysicalExpr for ToBinaryExpr {
             return Ok(parent);
         }
 
-        match parent {
-            ColumnarValue::Array(array) => {
-                let column = cast_to_binary(array.as_ref())?;
-                Ok(ColumnarValue::Array(column))
-            }
-            ColumnarValue::Scalar(scalar) => {
-                let array = scalar.to_array()?;
-                let column = cast_to_binary(array.as_ref())?;
-                let scalar = ScalarValue::try_from_array(&column, 0)?;
-                Ok(ColumnarValue::Scalar(scalar))
-            }
-        }
+        encode_columnar_value_to_binary(parent)
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {

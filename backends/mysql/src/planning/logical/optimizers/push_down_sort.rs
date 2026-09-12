@@ -61,7 +61,7 @@ impl PushDownSort {
         match expr {
             Expr::Column(c) => {
                 if let Some(ref relation) = c.relation {
-                    if relation.table() != scan_table.table_reference.table() {
+                    if relation.table() != scan_table.table_reference().table.as_ref() {
                         // Different table
                         return false;
                     }
@@ -132,6 +132,7 @@ impl PushDownSort {
             Expr::Placeholder(_) => false,
             Expr::OuterReferenceColumn(_, _) => false,
             Expr::Unnest(_) => false,
+            Expr::SetComparison(_) => false,
         }
     }
 }

@@ -24,23 +24,25 @@ base64 = "0.22.1"
 # For metadata serialization (temporary?)
 serde = "1.0.228"
 toml = { version = "0.9.8", features = ["serde"] }
-rkyv = { workspace = true }
 zerocopy = "0.8.31"
 bincode = { version = "2.0.1", features = ["derive"] }
-rand = "0.10.0-rc.5"
+rand = { workspace = true }
 
 bitflags = { version = "2.9.1", features = ["serde"] }
 
 tokio = "1.48.0"
 rustc-hash = { workspace = true }
 async-stream = "0.3.6"
+nohash-hasher = "0.2.0"
+tracing = { workspace = true }
 
 [features]
 default = []
 log-outgoing-queries = []
+log-dml-queries = []
 old-scan-converter = ["dep:datafusion-table-providers"]
-ident-normalization = []
 default-encrypt = []
+tracing = ["mysql_async/tracing"]
 
 [lints]
 workspace = true

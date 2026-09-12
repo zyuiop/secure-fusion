@@ -28,7 +28,7 @@ pub trait ColumnDefExt {
 impl ColumnDefExt for ColumnDef {
     fn is_primary_key(&self) -> bool {
         self.options.iter().any(|opt| match opt.option {
-            ColumnOption::Unique { is_primary, .. } => is_primary,
+            ColumnOption::PrimaryKey(_) => true,
             _ => false,
         })
     }

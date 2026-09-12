@@ -161,6 +161,7 @@ impl MySqlLogicalPlanner {
                 body: Box::new(SetExpr::Values(Values {
                     explicit_row: false,
                     rows: vec![values],
+                    value_keyword: false,
                 })),
 
                 order_by: None,

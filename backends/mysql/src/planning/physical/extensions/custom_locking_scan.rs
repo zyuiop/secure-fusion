@@ -1,5 +1,5 @@
 use crate::planning::logical::custom_locking_scan::CustomLockingScan;
-use crate::planning::physical::locking::transform_select_with_locking;
+use crate::planning::physical::transform::transform_select_with_locking;
 use async_trait::async_trait;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};

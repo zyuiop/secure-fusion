@@ -4,7 +4,8 @@ use common::{AuthenticationHandler, LoginMethod};
 use log::debug;
 use mysql_common::packets::{AuthPlugin, AuthSwitchRequest};
 use mysql_interop::ConnectionWrapper;
-use rand_core::{OsRng, TryRngCore};
+use rand::TryRng;
+use rand::rngs::SysRng;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -68,7 +69,7 @@ impl<'a> AuthPluginExt for AuthPlugin<'a> {
                 // https://dev.mysql.com/doc/dev/mysql-server/8.4.6/page_protocol_connection_phase_authentication_methods_native_password_authentication.html
                 // Removed in MySQL 9
                 let mut bytes = vec![0u8; 21];
-                OsRng
+                SysRng
                     .try_fill_bytes(&mut bytes)
                     .expect("could not generate random data!");
                 bytes[20] = 0;

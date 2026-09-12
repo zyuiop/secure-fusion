@@ -1,8 +1,7 @@
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::DataFusionError;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DataFusionError, Statistics};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -55,7 +54,7 @@ impl ExecutionPlan for PhysicalTracer {
         self.0.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.0.properties()
     }
 
@@ -111,21 +110,6 @@ impl ExecutionPlan for PhysicalTracer {
         let result = RecordBatchStreamAdapter::new(schema, stream);
 
         Ok(Box::pin(result))
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        self.0.metrics()
-    }
-
-    fn statistics(&self) -> datafusion::common::Result<Statistics> {
-        self.0.statistics()
-    }
-
-    fn partition_statistics(
-        &self,
-        partition: Option<usize>,
-    ) -> datafusion::common::Result<Statistics> {
-        self.0.partition_statistics(partition)
     }
 
     fn supports_limit_pushdown(&self) -> bool {

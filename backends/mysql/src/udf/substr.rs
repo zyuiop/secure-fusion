@@ -3,13 +3,14 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Int64Type};
 use datafusion::common::plan_datafusion_err;
+use datafusion::common::types::{NativeType, logical_binary, logical_int32, logical_int64};
 use datafusion::functions::unicode::substr::SubstrFunc;
 use datafusion::functions::utils::make_scalar_function;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult};
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    Coercion, ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    TypeSignature, TypeSignatureClass, Volatility,
 };
 use std::any::Any;
 use std::sync::Arc;
@@ -45,15 +46,31 @@ impl ExprPlanner for SubstrPlanner {
 impl Default for SubstrUdf {
     fn default() -> SubstrUdf {
         let native = SubstrFunc::default();
+        let base_signature = native.signature().type_signature.clone();
 
-        assert_eq!(
-            native.signature().type_signature,
-            TypeSignature::UserDefined
+        let string = Coercion::new_exact(TypeSignatureClass::Native(logical_binary()));
+        let int64 = Coercion::new_implicit(
+            TypeSignatureClass::Native(logical_int64()),
+            vec![TypeSignatureClass::Native(logical_int32())],
+            NativeType::Int64,
         );
 
         Self {
             native,
-            signature: Signature::new(TypeSignature::UserDefined, Volatility::Immutable),
+            signature: Signature::one_of(
+                vec![
+                    base_signature,
+                    TypeSignature::Coercible(vec![string.clone(), int64.clone()]),
+                    TypeSignature::Coercible(vec![string.clone(), int64.clone(), int64.clone()]),
+                ],
+                Volatility::Immutable,
+            )
+            .with_parameter_names(vec![
+                "str".to_string(),
+                "start_pos".to_string(),
+                "length".to_string(),
+            ])
+            .expect("valid parameter names"),
         }
     }
 }
@@ -104,26 +121,6 @@ impl ScalarUDFImpl for SubstrUdf {
             make_scalar_function(substr_func, vec![])(&args.args)
         } else {
             self.native.invoke_with_args(args)
-        }
-    }
-
-    fn coerce_types(&self, arg_types: &[DataType]) -> datafusion::common::Result<Vec<DataType>> {
-        let arg = arg_types.get(0).ok_or_else(|| {
-            plan_datafusion_err!("invalid call to function SUBSTR, requires three arguments")
-        })?;
-
-        if Self::should_handle(arg) {
-            let first_type = arg.clone();
-            let mut base = self.native.coerce_types(&[
-                DataType::Utf8,
-                arg_types[1].clone(),
-                arg_types[2].clone(),
-            ])?;
-            base[0] = first_type;
-            Ok(base)
-        } else {
-            // self.native.coerce_types(arg_types)
-            panic!()
         }
     }
 }

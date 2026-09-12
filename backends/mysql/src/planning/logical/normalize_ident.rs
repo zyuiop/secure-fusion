@@ -1,7 +1,10 @@
 use datafusion::logical_expr::sqlparser::ast::{
-    AssignmentTarget, Expr, ObjectName, ObjectNamePart, Statement, TableConstraint,
+    AlterTable, AssignmentTarget, CheckConstraint, Expr, ForeignKeyConstraint, IndexConstraint,
+    ObjectName, ObjectNamePart, Statement, TableConstraint, UniqueConstraint, Update,
 };
-use datafusion::sql::sqlparser::ast::{Ident, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{
+    FullTextOrSpatialConstraint, Ident, PrimaryKeyConstraint, VisitMut, VisitorMut,
+};
 use std::ops::ControlFlow;
 
 pub struct Normalizer;
@@ -51,7 +54,7 @@ impl VisitorMut for Normalizer {
 
     fn post_visit_statement(&mut self, statement: &mut Statement) -> ControlFlow<Self::Break> {
         match statement {
-            Statement::Update { assignments, .. } => {
+            Statement::Update(Update { assignments, .. }) => {
                 assignments
                     .iter_mut()
                     .for_each(|assgt| match &mut assgt.target {
@@ -61,9 +64,9 @@ impl VisitorMut for Normalizer {
                         }
                     });
             }
-            Statement::AlterTable {
+            Statement::AlterTable(AlterTable {
                 name, operations, ..
-            } => {
+            }) => {
                 normalize_object_name(name);
                 operations.iter_mut().for_each(|op| {
                     // Let's hope this is enough...
@@ -99,44 +102,44 @@ impl VisitorMut for Normalizer {
                 tbl.constraints
                     .iter_mut()
                     .for_each(|constraint| match constraint {
-                        TableConstraint::FulltextOrSpatial {
+                        TableConstraint::FulltextOrSpatial(FullTextOrSpatialConstraint {
                             opt_index_name: index_name,
                             columns,
                             ..
-                        }
-                        | TableConstraint::Index {
+                        })
+                        | TableConstraint::Index(IndexConstraint {
                             columns,
                             name: index_name,
                             ..
-                        }
-                        | TableConstraint::PrimaryKey {
+                        })
+                        | TableConstraint::PrimaryKey(PrimaryKeyConstraint {
                             index_name,
                             columns,
                             ..
-                        }
-                        | TableConstraint::Unique {
+                        })
+                        | TableConstraint::Unique(UniqueConstraint {
                             index_name,
                             columns,
                             ..
-                        } => {
+                        }) => {
                             normalize_identifiers(index_name.as_mut_slice());
                             columns.iter_mut().for_each(|col| {
                                 let _ = col.column.expr.visit(self);
                             });
                         }
-                        TableConstraint::ForeignKey {
+                        TableConstraint::ForeignKey(ForeignKeyConstraint {
                             index_name,
                             columns,
                             foreign_table,
                             referred_columns,
                             ..
-                        } => {
+                        }) => {
                             normalize_identifiers(index_name.as_mut_slice());
                             normalize_identifiers(columns.as_mut_slice());
                             normalize_identifiers(referred_columns.as_mut_slice());
                             normalize_object_name(foreign_table);
                         }
-                        TableConstraint::Check { expr, .. } => {
+                        TableConstraint::Check(CheckConstraint { expr, .. }) => {
                             let _ = expr.visit(self);
                         }
                     });

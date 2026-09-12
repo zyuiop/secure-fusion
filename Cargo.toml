@@ -3,7 +3,7 @@ resolver = "3"
 members = ["backends/mysql", "common", "frontends/mysql", "proxy", "protocols/mysql", "server", "crypto", "tools/benchmarks"]
 
 [workspace.dependencies]
-datafusion = { version = "51.0.0", features = ["nested_expressions",
+datafusion = { version = "53.1.0", features = ["nested_expressions",
     "crypto_expressions",
     "datetime_expressions",
     "encoding_expressions",
@@ -14,13 +14,13 @@ datafusion = { version = "51.0.0", features = ["nested_expressions",
     "recursive_protection",
     "sql",
     "serde"], default-features = false }
-arrow-schema = { version = "57.0.0", features = ["serde"] }
 futures = "0.3.31"
 futures-util = "0.3.31"
 async-trait = "0.1.88"
 
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-util = { version = "0.7.17", features = ["full"] }
+rand = { version = "0.10.1", features = ["sys_rng"] }
 
 num_enum = "0.7.4"
 log = "0.4.27"
@@ -35,16 +35,16 @@ hex = "0.4.3"
 rustc-hash = "2.1.1"
 nohash-hasher = "0.2.0"
 rkyv = "0.8.12"
+tracing = { version = "0.1.44" }
 
 [patch.crates-io]
-sqlparser = { git = 'https://github.com/zyuiop/datafusion-sqlparser-rs', branch = "patched-v0.59.0" }
-datafusion = { git = 'https://github.com/zyuiop/datafusion', branch = "patched-v51.0.0" }
+datafusion = { git = 'https://github.com/zyuiop/datafusion', branch = "patched-v53.1.0" }
+# datafusion = { path = '/home/zyuiop/phd/datafusion/datafusion/core' }
 
 [profile.release]
 # For a slight performance boost (+15%) at the cost of a 8mn compile time :D
 lto = "fat"
 codegen-units = 1
-
 
 # For benchmarking
 # debug = "line-tables-only"
@@ -57,6 +57,7 @@ perf = "deny"
 disallowed-types = { level = "deny" }
 
 [workspace.lints.rust]
+unused = "deny"
 unused_must_use = "deny"
 unreachable_code = "deny"
 unreachable_patterns = "deny"

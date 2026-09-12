@@ -15,6 +15,31 @@ pub struct BackendConfig {
     pub mysql_connect_string: String,
 
     pub metadata_store: MetadataStoreConfig,
+
+    #[cfg(feature = "index-search")]
+    pub index_search: Option<IndexSearchSatelliteConfig>,
+
+    #[serde(default)]
+    pub row_binding_aad: bool,
+
+    pub df_hash_join_max_pushdown_values: Option<usize>,
+
+    pub df_hash_join_max_pushdown_size_per_value: Option<usize>,
+
+    pub df_repartition_joins: Option<bool>,
+
+    pub df_target_parallelism: Option<usize>,
+
+    pub df_default_filter_selectivity: Option<u8>,
+
+    pub df_batch_size: Option<usize>,
+}
+
+#[cfg(feature = "index-search")]
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct IndexSearchSatelliteConfig {
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -43,6 +68,17 @@ impl Default for BackendConfig {
             encrypt_by_default: true,
             mysql_connect_string: "mysql://user:password@host:3306/".into(),
             metadata_store: MetadataStoreConfig::Disk(StoreToDisk::default()),
+            row_binding_aad: false,
+
+            #[cfg(feature = "index-search")]
+            index_search: None,
+
+            df_hash_join_max_pushdown_values: None,
+            df_hash_join_max_pushdown_size_per_value: None,
+            df_repartition_joins: None,
+            df_target_parallelism: None,
+            df_default_filter_selectivity: None,
+            df_batch_size: None,
         }
     }
 }

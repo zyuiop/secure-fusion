@@ -8,14 +8,14 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
-use datafusion::sql::TableReference;
+use datafusion::sql::ResolvedTableReference;
 use mysql_async::prelude::{BatchQuery, Queryable, WithParams};
 use std::fmt::{Debug, Formatter};
 use std::ops::DerefMut;
 use std::sync::Arc;
 
 pub struct MySqlDeleteSink {
-    target_table: TableReference,
+    target_table: ResolvedTableReference,
     primary_key_schema: SchemaRef,
 }
 
@@ -30,7 +30,7 @@ impl Debug for MySqlDeleteSink {
 }
 
 impl MySqlDeleteSink {
-    pub(crate) fn new(target_table: TableReference, primary_key_schema: SchemaRef) -> Self {
+    pub(crate) fn new(target_table: ResolvedTableReference, primary_key_schema: SchemaRef) -> Self {
         Self {
             target_table,
             primary_key_schema,
@@ -66,7 +66,10 @@ impl RecordBatchSink for MySqlDeleteSink {
             .collect::<Vec<_>>()
             .join(" AND ");
 
-        let query = format!(r#"DELETE FROM {} WHERE {filters}"#, &self.target_table);
+        let query = format!(
+            r#"DELETE FROM {}.{} WHERE {filters}"#,
+            self.target_table.schema, self.target_table.table
+        );
 
         #[cfg(feature = "log-outgoing-queries")]
         log::info!("Sending: {query}");

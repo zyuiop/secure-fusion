@@ -1,62 +1,56 @@
-use crate::cipher::{AssociatedData, Cipher};
-use crate::encrypted_column_meta::EncryptedColumnMeta;
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryArray, RecordBatch};
+use crate::arrow::decode_array_from_binary;
+use crate::cipher::Cipher;
+use crate::{CipherContext, LongTermKeyManager};
+use datafusion::arrow::array::{Array, ArrayIter, ArrayRef, AsArray, BinaryArray, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, FieldRef, Schema};
-use datafusion::common::{DataFusionError, exec_err};
-use datafusion::logical_expr::interval_arithmetic::Interval;
-use datafusion::logical_expr::statistics::Distribution;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DataFusionError, exec_err, plan_datafusion_err};
 use datafusion::logical_expr::{
-    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    Volatility,
 };
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::scalar::ScalarValue;
-use rand_core::{OsRng, TryRngCore};
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct DecryptExpr {
-    token: u128, // Random value that identifies this object
-
-    child: Arc<dyn PhysicalExpr>, // We could optionally take a second child for AAD
+    decrypt_child: Arc<dyn PhysicalExpr>,
+    aad_source_child: Arc<dyn PhysicalExpr>,
     cipher: Arc<dyn Cipher>,
-    associated_data: AssociatedData,
-    // TODO: Move to cast
 }
 
 impl Debug for DecryptExpr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "DecryptExpr{{token: {}, child: {:?}, aad: {:?}}}",
-            self.token, self.child, self.associated_data
+            "DecryptExpr{{children: {:?}, {:?}}}",
+            self.decrypt_child, self.aad_source_child
         )
     }
 }
 
 impl DecryptExpr {
     pub fn new(
-        child: Arc<dyn PhysicalExpr>,
+        decrypt_child: Arc<dyn PhysicalExpr>,
+        aad_source_child: Arc<dyn PhysicalExpr>,
         cipher: Arc<dyn Cipher>,
-        associated_data: AssociatedData,
     ) -> Self {
-        let mut bytes = [0u8; size_of::<u128>()];
-        OsRng.try_fill_bytes(&mut bytes).unwrap();
-        let token = u128::from_le_bytes(bytes);
-
         Self {
-            token,
-            child,
+            decrypt_child,
+            aad_source_child,
             cipher,
-            associated_data,
         }
     }
 }
 
 impl PartialEq for DecryptExpr {
     fn eq(&self, other: &Self) -> bool {
-        other.token == self.token
+        &self.decrypt_child == &other.decrypt_child
+            && &self.aad_source_child == &other.aad_source_child
     }
 }
 
@@ -64,13 +58,18 @@ impl Eq for DecryptExpr {}
 
 impl Display for DecryptExpr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DecryptExpr({})", self.child)
+        write!(
+            f,
+            "DecryptExpr({}, {})",
+            self.decrypt_child, self.aad_source_child
+        )
     }
 }
 
 impl Hash for DecryptExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u128(self.token);
+        self.decrypt_child.hash(state);
+        self.aad_source_child.hash(state);
     }
 }
 
@@ -84,27 +83,21 @@ impl PhysicalExpr for DecryptExpr {
     }
 
     fn nullable(&self, input_schema: &Schema) -> datafusion::common::Result<bool> {
-        self.child.nullable(input_schema)
+        self.decrypt_child.nullable(input_schema)
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> datafusion::common::Result<ColumnarValue> {
-        let parent = self.child.evaluate(batch)?;
-        match parent {
+        let decrypt = self.decrypt_child.evaluate(batch)?;
+        let aad = self.aad_source_child.evaluate(batch)?;
+
+        match decrypt {
             ColumnarValue::Array(array) => {
-                let column = decrypt_array(
-                    self.cipher.as_ref(),
-                    array.as_binary(),
-                    &self.associated_data,
-                )?;
+                let column = decrypt_array(&self.cipher, array.as_binary(), aad)?;
                 Ok(ColumnarValue::Array(column))
             }
             ColumnarValue::Scalar(scalar) => {
                 let array = scalar.to_array()?;
-                let column = decrypt_array(
-                    self.cipher.as_ref(),
-                    array.as_binary(),
-                    &self.associated_data,
-                )?;
+                let column = decrypt_array(&self.cipher, array.as_binary(), aad)?;
                 let scalar = ScalarValue::try_from_array(&column, 0)?;
                 Ok(ColumnarValue::Scalar(scalar))
             }
@@ -112,118 +105,59 @@ impl PhysicalExpr for DecryptExpr {
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        vec![&self.child]
+        vec![&self.decrypt_child, &self.aad_source_child]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> datafusion::common::Result<Arc<dyn PhysicalExpr>> {
-        if children.is_empty() || children.len() > 1 {
+        if children.len() != 2 {
             Err(DataFusionError::Plan(
                 "Invalid number of children".to_string(),
             ))
         } else {
-            match Arc::try_unwrap(self) {
-                Ok(DecryptExpr {
-                    token,
-                    child: _,
-                    associated_data,
-                    cipher,
-                }) => Ok(Arc::new(DecryptExpr {
-                    token,
-                    associated_data,
-                    cipher,
-                    child: children.pop().unwrap(),
-                })),
-                Err(this) => Ok(Arc::new(Self::new(
-                    children.pop().unwrap(),
-                    this.cipher.clone(),
-                    this.associated_data.clone(),
-                ))),
-            }
+            let mut new_me = Arc::unwrap_or_clone(self);
+            new_me.aad_source_child = children.pop().unwrap();
+            new_me.decrypt_child = children.pop().unwrap();
+            Ok(Arc::new(new_me))
         }
     }
 
     fn fmt_sql(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         _f.write_str("decrypt(")?;
-        self.child.fmt_sql(_f)?;
+        self.decrypt_child.fmt_sql(_f)?;
+        _f.write_str(", ")?;
+        self.aad_source_child.fmt_sql(_f)?;
         _f.write_str(")")
     }
 
     fn is_volatile_node(&self) -> bool {
-        self.child.is_volatile_node()
-    }
-
-    fn propagate_constraints(
-        &self,
-        interval: &Interval,
-        children: &[&Interval],
-    ) -> datafusion::common::Result<Option<Vec<Interval>>> {
-        self.child.propagate_constraints(interval, children)
-    }
-
-    fn propagate_statistics(
-        &self,
-        parent: &Distribution,
-        children: &[&Distribution],
-    ) -> datafusion::common::Result<Option<Vec<Distribution>>> {
-        self.child.propagate_statistics(parent, children)
-    }
-
-    fn evaluate_statistics(
-        &self,
-        children: &[&Distribution],
-    ) -> datafusion::common::Result<Distribution> {
-        self.child.evaluate_statistics(children)
-    }
-
-    fn evaluate_bounds(&self, _children: &[&Interval]) -> datafusion::common::Result<Interval> {
-        self.child.evaluate_bounds(_children)
+        false
     }
 }
 
-#[cfg(not(feature = "decrypt-array-in-place"))]
-pub(crate) fn decrypt_array(
-    cipher: &dyn Cipher,
-    column: &BinaryArray,
-    associated_data: &AssociatedData,
-) -> datafusion::common::Result<ArrayRef> {
-    let nonce_size = cipher.nonce_size();
-    let entries = column.len();
-    let total_nonce_size = entries * nonce_size;
-    let total_decrypted_size = column.get_buffer_memory_size() - total_nonce_size;
+enum AssociatedDataIter<'a> {
+    ScalarValue(&'a [u8]),
+    BinaryArray(ArrayIter<&'a BinaryArray>),
+}
 
-    let mut builder = datafusion::arrow::array::GenericByteBuilder::<
-        datafusion::arrow::datatypes::BinaryType,
-    >::with_capacity(entries, total_decrypted_size);
+impl<'a> Iterator for AssociatedDataIter<'a> {
+    type Item = Option<&'a [u8]>;
 
-    for v in column.iter() {
-        let Some(ciphertext) = v else {
-            builder.append_null();
-            continue;
-        };
-
-        let decrypted_value = cipher.decrypt_with_nonce(ciphertext, associated_data);
-
-        match decrypted_value {
-            Ok(value) => builder.append_value(value),
-            Err(_) => exec_err!(
-                "Could not decrypt value (corrupted data or bad plan?)! {:?}",
-                associated_data
-            )?,
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            AssociatedDataIter::ScalarValue(v) => Some(Some(*v)),
+            AssociatedDataIter::BinaryArray(v) => v.next(),
         }
     }
-
-    let new_col = builder.finish();
-    Ok(Arc::new(new_col))
 }
 
-#[cfg(feature = "decrypt-array-in-place")]
-pub(crate) fn decrypt_array(
-    cipher: &dyn Cipher,
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip_all))]
+pub fn decrypt_array(
+    cipher: &Arc<dyn Cipher>,
     column: &BinaryArray,
-    associated_data: &AssociatedData,
+    associated_data: ColumnarValue,
 ) -> datafusion::common::Result<ArrayRef> {
     use datafusion::arrow::array::{NullBufferBuilder, OffsetBufferBuilder};
     use datafusion::arrow::buffer::MutableBuffer;
@@ -238,19 +172,27 @@ pub(crate) fn decrypt_array(
 
     let mut written_bytes = 0usize;
 
-    for v in column.iter() {
+    let aad_iter = match &associated_data {
+        ColumnarValue::Array(arr) => AssociatedDataIter::BinaryArray(arr.as_binary().iter()),
+        ColumnarValue::Scalar(sv) => match sv {
+            ScalarValue::Binary(Some(v)) => AssociatedDataIter::ScalarValue(v.as_slice()),
+            _ => exec_err!("invalid aad type: {}", sv.data_type())?,
+        },
+    };
+
+    for (v, aad) in column.iter().zip(aad_iter) {
         null_offset_buffer.append(v.is_some());
 
         let Some(ciphertext) = v else {
             offset_buffer.push_length(0);
             continue;
         };
+        let Some(aad) = aad else {
+            exec_err!("null AAD encountered in row")?
+        };
 
-        let decrypted_bytes = cipher.decrypt_with_nonce_to_slice(
-            &mut array[written_bytes..],
-            ciphertext,
-            associated_data,
-        );
+        let decrypted_bytes =
+            cipher.decrypt_with_nonce_to_slice(&mut array[written_bytes..], ciphertext, aad);
 
         match decrypted_bytes {
             Ok(value) => {
@@ -273,24 +215,95 @@ pub(crate) fn decrypt_array(
     Ok(Arc::new(new_col))
 }
 
-#[derive(Eq, PartialEq, Debug, Hash)]
+#[derive(Debug)]
 pub struct DecryptUdf {
     signature: Signature,
-    pub(crate) output_field: FieldRef,
-    pub(crate) meta: EncryptedColumnMeta,
+    cipher_context: CipherContext,
+    output_field: FieldRef,
+    key_manager: Arc<LongTermKeyManager>,
 }
 
 impl DecryptUdf {
-    pub fn new(output_field: FieldRef, meta: EncryptedColumnMeta) -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Volatile),
-            output_field,
-            meta,
+    pub const DECRYPT_UDF_NAME: &str = "__internal__decrypt__";
+
+    #[inline(always)]
+    pub fn eliminate_decrypt_in_expr(expr: &Expr) -> datafusion::common::Result<&Expr> {
+        if let Expr::ScalarFunction(sf) = expr
+            && sf.func.name() == Self::DECRYPT_UDF_NAME
+        {
+            // Strip decryption function as it may prevent filters from being detected
+            sf.args.get(0).ok_or(plan_datafusion_err!(
+                "encountered decryption function with no argument"
+            ))
+        } else {
+            Ok(expr)
         }
+    }
+
+    pub fn eliminate_decrypt_recursively(expr: Expr) -> datafusion::common::Result<Expr> {
+        Ok(expr
+            .transform_up(|sub_expr| match sub_expr {
+                Expr::ScalarFunction(sf) if sf.name() == Self::DECRYPT_UDF_NAME => {
+                    let arg = sf.args.get(0).cloned().ok_or(plan_datafusion_err!(
+                        "encountered decryption function with no argument"
+                    ))?;
+                    Ok(Transformed::yes(arg))
+                }
+                other => Ok(Transformed::no(other)),
+            })?
+            .data)
     }
 }
 
-pub(crate) const DECRYPT_PSEUDOFUNC_NAME: &str = "__internal__decrypt__";
+impl PartialEq for DecryptUdf {
+    fn eq(&self, other: &Self) -> bool {
+        other.signature == self.signature
+            && other.output_field == self.output_field
+            && self.cipher_context == self.cipher_context
+    }
+}
+
+impl Hash for DecryptUdf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.signature.hash(state);
+        self.output_field.hash(state);
+        self.cipher_context.hash(state);
+    }
+}
+
+impl Eq for DecryptUdf {}
+
+impl DecryptUdf {
+    pub fn new(
+        output_field: FieldRef,
+        cipher_context: CipherContext,
+        long_term_key_manager: Arc<LongTermKeyManager>,
+    ) -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Stable),
+            output_field,
+            cipher_context,
+            key_manager: long_term_key_manager,
+        }
+    }
+
+    pub fn invoke(
+        output_field: FieldRef,
+        cipher_context: CipherContext,
+        long_term_key_manager: Arc<LongTermKeyManager>,
+        encrypted_column: Expr,
+        computed_aad: Expr,
+    ) -> Expr {
+        ScalarUDF::new_from_impl(Self::new(
+            output_field,
+            cipher_context,
+            long_term_key_manager,
+        ))
+        .call(vec![encrypted_column, computed_aad])
+    }
+}
+
+pub(crate) const DECRYPT_PSEUDOFUNC_NAME: &str = DecryptUdf::DECRYPT_UDF_NAME;
 
 impl ScalarUDFImpl for DecryptUdf {
     fn as_any(&self) -> &dyn Any {
@@ -318,8 +331,30 @@ impl ScalarUDFImpl for DecryptUdf {
 
     fn invoke_with_args(
         &self,
-        _args: ScalarFunctionArgs,
+        mut args: ScalarFunctionArgs,
     ) -> datafusion::common::Result<ColumnarValue> {
-        exec_err!("decrypt function should have been rewritten!")
+        // Note: this implementation provides both `from_binary` and `decrypt` at once.
+        let cipher = self.key_manager.get_cipher(&self.cipher_context);
+
+        let aad = args.args.pop().unwrap();
+
+        let enc = args.args.pop().unwrap();
+
+        match enc {
+            ColumnarValue::Array(array) => {
+                let column = decrypt_array(&cipher, array.as_binary(), aad)?;
+                let column =
+                    decode_array_from_binary(column.as_binary(), &self.output_field.data_type())?;
+                Ok(ColumnarValue::Array(column))
+            }
+            ColumnarValue::Scalar(scalar) => {
+                let array = scalar.to_array()?;
+                let column = decrypt_array(&cipher, array.as_binary(), aad)?;
+                let column =
+                    decode_array_from_binary(column.as_binary(), &self.output_field.data_type())?;
+                let scalar = ScalarValue::try_from_array(&column, 0)?;
+                Ok(ColumnarValue::Scalar(scalar))
+            }
+        }
     }
 }

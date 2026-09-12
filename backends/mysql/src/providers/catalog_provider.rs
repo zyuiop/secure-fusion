@@ -4,11 +4,12 @@ use crate::errors::{ColumnError, MySqlBackendError, MySqlBackendErrorInner};
 use crate::metadata::{ColumnName, EncryptedSchemaMeta, EncryptedTableMeta};
 use crate::providers::parser::{parse_column_type, parse_default_value_to_expr};
 use crate::providers::schema_provider::MySqlSchemaProvider;
-use crate::providers::table_provider::MySqlTableProvider;
+use crate::providers::table_provider::{MySqlTableProvider, TableStatistics};
 use crate::store::MetadataStore;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::logical_expr::sqlparser::ast::PrimaryKeyConstraint;
 use datafusion::logical_expr::sqlparser::tokenizer::Token;
-use datafusion::sql::TableReference;
+use datafusion::sql::ResolvedTableReference;
 use datafusion::sql::sqlparser::ast::{ColumnDef, ColumnOption, ColumnOptionDef, Ident};
 use log::{info, trace};
 use mysql_async::prelude::{FromRow, Queryable};
@@ -95,10 +96,14 @@ impl TryFrom<MySqlColumnDescription> for ColumnDef {
         if value.column_key == "PRI" {
             options.push(ColumnOptionDef {
                 name: None,
-                option: ColumnOption::Unique {
-                    is_primary: true,
+                option: ColumnOption::PrimaryKey(PrimaryKeyConstraint {
+                    name: None,
                     characteristics: None,
-                },
+                    columns: vec![], // ignored in this context
+                    index_name: None,
+                    index_options: vec![],
+                    index_type: None,
+                }),
             })
         }
         if value.extra.contains("auto_increment") {
@@ -142,8 +147,8 @@ impl TryFrom<MySqlColumnDescription> for ColumnDef {
 }
 
 struct TableBuilder {
-    table_schema: String,
-    table_name: String,
+    table_statistics: TableStatistics,
+    resolved_table_reference: ResolvedTableReference,
     columns: Vec<ColumnDef>,
     primary_key_members: Vec<usize>, // TODO: check relevance
     // defaults: HashMap<String, Expr>,
@@ -151,35 +156,44 @@ struct TableBuilder {
 }
 
 impl TableBuilder {
+    fn schema(&self) -> String {
+        String::from(self.resolved_table_reference.schema.as_ref())
+    }
+    fn table(&self) -> String {
+        String::from(self.resolved_table_reference.table.as_ref())
+    }
+
     fn new(
+        table_catalog: Arc<str>,
         table_schema: String,
         table_name: String,
         encryption_metadata: Option<EncryptedTableMeta>,
+        table_statistics: TableStatistics,
     ) -> Self {
         trace!("New table builder {table_schema}:{table_name}, {encryption_metadata:?}");
 
         Self {
-            table_schema,
-            table_name,
+            resolved_table_reference: ResolvedTableReference {
+                catalog: table_catalog.into(),
+                schema: table_schema.into(),
+                table: table_name.into(),
+            },
             columns: Vec::new(),
             primary_key_members: Vec::new(),
             // defaults: HashMap::new(),
             encryption_metadata,
+            table_statistics,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.table_name.is_empty() && self.columns.is_empty()
+        self.resolved_table_reference.table.is_empty() && self.columns.is_empty()
     }
 
     #[inline]
     fn is_same_table(&self, column: &MySqlColumnDescription) -> bool {
-        self.table_name == column.table_name && self.is_same_schema(column)
-    }
-
-    #[inline]
-    fn is_same_schema(&self, column: &MySqlColumnDescription) -> bool {
-        self.table_schema == column.table_schema
+        self.resolved_table_reference.table.as_ref() == column.table_name
+            && self.resolved_table_reference.schema.as_ref() == column.table_schema
     }
 
     fn add_column(&mut self, column: MySqlColumnDescription) -> Result<(), MySqlBackendError> {
@@ -199,10 +213,11 @@ impl TableBuilder {
             .collect::<Vec<ColumnName>>();
 
         Arc::new(MySqlTableProvider::from_columns(
-            TableReference::partial(self.table_schema.clone(), self.table_name.clone()),
+            self.resolved_table_reference,
             self.columns,
             primary_key,
             self.encryption_metadata,
+            self.table_statistics,
         ))
     }
 }
@@ -214,10 +229,13 @@ impl MySqlCatalogProvider {
     const EXCLUDED_SCHEMAS: &str = "'performance_schema', 'sys'";
 
     pub(crate) async fn introspect(
+        catalog_name: &str,
         mut conn: Conn,
         metadata_store: &MetadataStore,
         ident_normalization: bool,
     ) -> Result<Arc<MySqlCatalogProvider>, MySqlBackendError> {
+        let catalog_name: Arc<str> = catalog_name.to_string().into();
+
         info!("Begin introspection of all databases on server...");
 
         let schemas = conn
@@ -230,7 +248,10 @@ impl MySqlCatalogProvider {
         let mut encryption_metas: FxHashMap<String, EncryptedSchemaMeta> = FxHashMap::default();
         for schema in schemas.iter() {
             let metadata = metadata_store.read_metadata(schema).await?;
-            encryption_metas.insert(schema.clone(), metadata.deserialize());
+            encryption_metas.insert(
+                schema.clone(),
+                metadata.deserialize(catalog_name.clone(), schema.clone().into()),
+            );
         }
 
         let mut schemas = schemas
@@ -245,13 +266,24 @@ impl MySqlCatalogProvider {
             WHERE table_schema NOT IN ({})
             ORDER BY table_schema, table_name, ordinal_position", Self::EXCLUDED_SCHEMAS)).await?;
 
-        let mut builder = TableBuilder::new(String::new(), String::new(), None); // initial instance will get ignored
+        let empty = Arc::<str>::from("");
+        let mut builder = TableBuilder::new(
+            catalog_name.clone(),
+            String::new(),
+            String::new(),
+            None,
+            TableStatistics::for_empty_table(ResolvedTableReference {
+                table: empty.clone(),
+                schema: empty.clone(),
+                catalog: empty.clone(),
+            }),
+        ); // initial instance will get ignored
 
         let mut insert_schema = |table_builder: TableBuilder| {
             schemas
-                .entry(table_builder.table_schema.clone())
+                .entry(table_builder.schema())
                 .or_default()
-                .register_mysql_table(table_builder.table_name.clone(), table_builder.build())
+                .register_mysql_table(table_builder.table(), table_builder.build())
                 .map_err(|e| Box::new(MySqlBackendErrorInner::IntrospectionError(e)))?;
 
             Ok::<(), MySqlBackendError>(())
@@ -266,20 +298,30 @@ impl MySqlCatalogProvider {
             let encryption_meta = encryption_metas.get(&col_desc.table_schema);
 
             if !builder.is_same_table(&col_desc) {
+                let stats = TableStatistics::new(
+                    ResolvedTableReference {
+                        catalog: catalog_name.clone(),
+                        schema: col_desc.table_schema.clone().into(),
+                        table: col_desc.table_name.clone().into(),
+                    },
+                    &mut conn,
+                )
+                .await
+                .unwrap();
+
                 let new_builder = TableBuilder::new(
+                    catalog_name.clone(),
                     col_desc.table_schema.clone(),
                     col_desc.table_name.clone(),
                     encryption_meta
                         .and_then(|meta| meta.table(&col_desc.table_name))
                         .cloned(),
+                    stats,
                 );
                 let old_builder = mem::replace(&mut builder, new_builder);
 
                 if !old_builder.is_empty() {
-                    info!(
-                        "Found table {}:{}",
-                        &old_builder.table_schema, &old_builder.table_name
-                    );
+                    info!("Found table {}", &old_builder.resolved_table_reference);
 
                     insert_schema(old_builder)?;
                 }
@@ -290,10 +332,7 @@ impl MySqlCatalogProvider {
 
         // Add the last column
         if !builder.is_empty() {
-            info!(
-                "Found table {}:{}",
-                &builder.table_schema, &builder.table_name
-            );
+            info!("Found table {}", &builder.resolved_table_reference);
 
             insert_schema(builder)?;
         }

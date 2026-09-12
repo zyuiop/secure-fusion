@@ -15,4 +15,6 @@ pub trait Dataset {
     fn drop_database(&mut self, _conn: &mut Conn) {}
 
     fn load_insert_data(&mut self, _conn: &mut Conn) {}
+
+    fn run_benchmark(&self, _conn: &mut Conn) {}
 }

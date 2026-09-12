@@ -4,6 +4,7 @@ use crate::providers::table_provider::MySqlTableProvider;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::TableSource;
+use datafusion::prelude::SessionConfig;
 use datafusion::sql::TableReference;
 use std::sync::Arc;
 
@@ -37,6 +38,18 @@ impl CatalogGetter for SessionState {
 
     fn default_schema(&self) -> &str {
         &self.config_options().catalog.default_schema
+    }
+}
+
+impl CatalogGetter for SessionConfig {
+    fn try_get_catalog(&self) -> Option<Arc<MySqlCatalogProvider>> {
+        let catalog: Arc<MySqlCatalogProviderList> = self.get_extension()?;
+
+        Some(catalog.default_catalog())
+    }
+
+    fn default_schema(&self) -> &str {
+        &self.options().catalog.default_schema
     }
 }
 

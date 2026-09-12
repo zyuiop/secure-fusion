@@ -113,15 +113,18 @@ impl<T: BackendWrappedSession> ProxySession for DataFusionSession<T> {
         #[cfg(feature = "df-trace")]
         let plan = crate::physical_tracer::PhysicalTracer::apply_recursive(plan)?;
 
-        let task_ctx = Arc::new(TaskContext::from(&session_state));
+        let task_ctx = TaskContext::from(&session_state);
 
         #[cfg(feature = "df-trace")]
-        let new_config = task_ctx
+        let cfg = task_ctx
             .session_config()
             .clone()
             .with_extension(Arc::new(Instant::now()));
+
         #[cfg(feature = "df-trace")]
-        let task_ctx = task_ctx.with_session_config(new_config);
+        let task_ctx = task_ctx.with_session_config(cfg);
+
+        let task_ctx = Arc::new(task_ctx);
 
         #[cfg(feature = "debug-plans")]
         {

@@ -36,7 +36,7 @@ pub struct RecordBatchSinkExec {
     input: Arc<dyn ExecutionPlan>,
     sink: Arc<dyn RecordBatchSink>,
     output_schema: SchemaRef,
-    props: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl RecordBatchSinkExec {
@@ -55,7 +55,7 @@ impl RecordBatchSinkExec {
 
         Self {
             input,
-            props,
+            properties: Arc::new(props),
             output_schema,
             sink,
         }
@@ -78,8 +78,8 @@ impl ExecutionPlan for RecordBatchSinkExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
-        &self.props
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -124,14 +124,27 @@ impl ExecutionPlan for RecordBatchSinkExec {
             tx_control.weak_start_transaction(&context).await;
 
             // We must pull all the data, because the MySQL connection is likely locked by the input stream
-            let underlying_result = profile!(
+            let underlying_result = match profile!(
                 "collect data for sink",
-                underlying_result.try_collect::<Vec<_>>().await?
-            );
-            let result = profile!(
+                underlying_result.try_collect::<Vec<_>>().await
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    tx_control.weak_rollback(&context).await;
+                    return Err(e);
+                }
+            };
+
+            let result = match profile!(
                 "push data to sink",
-                sink.handle_batches(underlying_result, &context).await?
-            );
+                sink.handle_batches(underlying_result, &context).await
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    tx_control.weak_rollback(&context).await;
+                    return Err(e);
+                }
+            };
 
             // Make the output record batch
             let result = RecordBatch::from(result);

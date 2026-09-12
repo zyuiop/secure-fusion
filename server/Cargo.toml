@@ -4,13 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 log  = { workspace = true }
 env_logger = "0.11.8"
 proxy = { path = "../proxy" }
 common = { path = "../common", features = [] }
 crypto = { path = "../crypto" }
-chacha20poly1305 = { version = "0.11.0-rc.0", features = ["zeroize"] }
 
 mysql-frontend = { path = "../frontends/mysql" }
 mysql-backend = { path = "../backends/mysql" }
@@ -21,16 +20,25 @@ snmalloc-rs = { version = "0.3.8", optional = true }
 
 serde = "1.0.228"
 toml = { version = "0.9.8", features = ["serde"] }
+tracing = { workspace = true }
+
+opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "rt-tokio-current-thread"] }
+tracing-opentelemetry = { version = "0.32.1" }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "alloc"] }
+ctrlc = "3.5.2"
+nohash-hasher = { workspace = true, optional = true }
 
 [features]
-default = ["snmalloc", "tpcc", "crypto/decrypt-array-in-place"]
+default = ["snmalloc", "crypto/crypto_all"]
 df-trace = ["proxy/df-trace"]
+tracing = ["proxy/tracing", "mysql-backend/tracing", "mysql-frontend/tracing", "crypto/tracing"]
+bench-tracing = ["tracing", "dep:nohash-hasher"]
 profile = ["common/profile", "proxy/profile", "mysql-frontend/log_queries", "proxy/debug-plans", "mysql-backend/log-outgoing-queries"]
 jemalloc = ["dep:tikv-jemallocator"]
 snmalloc = ["dep:snmalloc-rs"]
 
-tpcc = ["mysql-backend/ident-normalization"]
-hotcrp = ["mysql-backend/default-encrypt"]
-
 [lints]
 workspace = true
+

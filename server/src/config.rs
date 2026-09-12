@@ -10,15 +10,14 @@ macro_rules! gen_config {
         #[derive(serde::Deserialize, serde::Serialize)]
         pub struct $name {
             pub backend_config: $backend_config,
-            pub secret_key: String,
+            pub crypto_config: crypto::config::CryptoConfig,
         }
 
         impl Default for $name {
             fn default() -> Self {
                 Self {
                     backend_config: Default::default(),
-                    secret_key: "b6fd00728958b706fde7f9d5fde9637a5feadab81688b480ae66dcc3393f1284"
-                        .to_string(),
+                    crypto_config: Default::default(),
                 }
             }
         }

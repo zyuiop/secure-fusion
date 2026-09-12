@@ -54,6 +54,7 @@ pub enum MySqlFrontendCommand {
     SetVariable, /* TODO */
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument)]
 pub fn sql_to_statements(query: &str) -> Result<Vec<StatementAction>, ParseError> {
     trace!("Query: {}", query);
     let parsed = common::parser::sql_to_statements(&DIALECT, query)

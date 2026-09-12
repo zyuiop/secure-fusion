@@ -1,10 +1,8 @@
 use crate::providers::dummy_source::DummySource;
 use crate::providers::table_provider::MySqlTableProvider;
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::Field;
 use datafusion::catalog::{SchemaProvider, TableProvider};
-use datafusion::common::DataFusionError;
-use mysql_async::Conn;
+use datafusion::common::{DataFusionError, exec_err};
 use rustc_hash::FxHashMap;
 use std::any::Any;
 use std::sync::Arc;
@@ -36,7 +34,7 @@ impl MySqlSchemaProvider {
         let mut lock = self.tables.try_write().unwrap();
 
         if lock.contains_key(&name) {
-            return Err(DataFusionError::Execution("Table already exists".into()));
+            return exec_err!("Table {name} already exists")?;
         }
 
         lock.insert(name, table.clone());
@@ -49,28 +47,6 @@ impl MySqlSchemaProvider {
     ) -> datafusion::common::Result<Option<Arc<MySqlTableProvider>>> {
         let mut lock = self.tables.try_write().unwrap();
         Ok(lock.remove(name))
-    }
-
-    pub async fn force_create_indexable_column(
-        &self,
-        table_name: &str,
-        conn: &mut Conn,
-    ) -> datafusion::common::Result<Field> {
-        let mut lock = self.tables.try_write().unwrap();
-        let table = lock.remove(table_name).ok_or(
-            DataFusionError::Internal(format!("Invalid code path: tried to force indexable column creation on non-existing table {table_name}"))
-        )?;
-
-        let mut table = Arc::unwrap_or_clone(table.clone());
-        table.create_indexable_column(conn).await?;
-
-        let column = table
-            .get_indexable_column()
-            .expect("infaillible: indexable column has been created in the previous operation");
-
-        lock.insert(table_name.to_string(), Arc::new(table));
-
-        Ok(column)
     }
 
     pub fn replace_mysql_table(

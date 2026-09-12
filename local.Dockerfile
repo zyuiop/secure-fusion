@@ -1,7 +1,7 @@
-FROM debian:trixie-slim AS app
+FROM archlinux:base AS app
 ARG target=release
 
-RUN apt-get update && apt-get install -y openssl
+RUN pacman -Syu --noconfirm openssl
 
 WORKDIR /app
 COPY ./target/$target/server /app/proxy-server

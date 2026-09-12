@@ -6,8 +6,14 @@ edition = "2024"
 [dependencies]
 log = { workspace = true }
 datafusion = { workspace = true }
+datafusion-tracing = { version = "53.0.1", optional = true }
+tracing = { version = "0.1.44", optional = true }
+
 common = { path = "../common" }
 crypto = { path = "../crypto" }
+
+# Temporary - try to find a better solution
+mysql-backend = { path = "../backends/mysql" }
 
 # Crypto libraries
 async-trait = "0.1.88"
@@ -19,7 +25,11 @@ nohash-hasher = { workspace = true }
 [features]
 df-trace = []
 profile = ["common/profile"]
+tracing = ["dep:datafusion-tracing", "dep:tracing"]
 debug-plans = []
+# If enabled, replaces all literals with placeholders before building logical plan
+# Smart in theory, in practice breaks a lot of assumptions of how DF works, so not great...
+cache-genericize-queries = []
 
 [lints]
 workspace = true

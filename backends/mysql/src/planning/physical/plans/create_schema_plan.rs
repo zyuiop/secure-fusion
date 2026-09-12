@@ -47,6 +47,8 @@ impl CreateSchemaPlan {
             catalog_sync_namespace_flatten_delimiter: None,
             with_tags: None,
             with_contacts: None,
+            default_charset: None,
+            default_collation: None,
         };
 
         let extra_impl = Self {

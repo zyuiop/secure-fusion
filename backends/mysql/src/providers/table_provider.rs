@@ -1,12 +1,17 @@
 use crate::arrow_helper::project_schema_safe;
+use crate::ast_expr_ext::AstExprExt;
+use crate::filtering::resolver::{IndexResolver, ResolveIndexResult};
+use crate::get_catalog::CatalogGetter;
+use crate::get_conn::ConnGetter;
 use crate::metadata;
 use crate::metadata::{
-    ColumnName, EncryptedColumnMeta, EncryptedTableMeta, IndexInsertStrategy, IndexQueryStrategy,
-    PrimaryKey, PrimaryKeyColumnDef, compute_expected_indexable_column_type,
+    ColumnName, EncryptedColumnMeta, EncryptedTableMeta, IndexInsertStrategy, PrimaryKey,
+    PrimaryKeyColumnDef, supports_aad_binding,
 };
-use crate::planning::logical::CURRENT_VALUE_PREFIX;
-use crate::planning::physical::locking::transform_select_with_locking;
+use crate::planning::logical::{CURRENT_VALUE_PREFIX, DUPLICATE_VALUE_PFX, FILTER_PREFIX};
+use crate::planning::physical::plans::create_rowid_plan::CreateRowidPlan;
 use crate::planning::physical::plans::mysql_scan_plan::MySqlScanPlan;
+use crate::planning::physical::transform::transform_select_with_locking;
 use crate::providers::parser::{parse_column_type, parse_default_value_to_expr};
 use crate::sinks::multiplex_sink::MultiplexSink;
 use crate::sinks::mysql_delete_sink::MySqlDeleteSink;
@@ -16,45 +21,45 @@ use async_trait::async_trait;
 use common::conversions::column_def_ext::ColumnDefExt;
 use common::conversions::datatypes::ArrowDatatypeConverter;
 use common::metadata::{MetadataReads, MetadataWrites};
-use crypto::cipher::AssociatedData;
-use crypto::key_manager::KeyManager;
 use crypto::planning::decrypt_planner::project_decrypt;
+use crypto::planning::physical::compute_aad::ComputeAadExpr;
 use crypto::planning::physical::encrypt::EncryptExpr;
 use crypto::planning::physical::to_binary::ToBinaryExpr;
-use crypto::{CipherContext, KeyManagerGetter};
-use datafusion::arrow::array::{BinaryBuilder, RecordBatch};
+use crypto::row_id::RowIdColumn;
+use crypto::{CipherContext, IdentifierContext, KeyManagerGetter};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, Constraint, Constraints, DFSchema, Statistics, plan_err};
-use datafusion::datasource::TableType;
-use datafusion::error::DataFusionError;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{
-    BinaryExpr, ColumnarValue, Expr, LogicalPlan, Operator, TableProviderFilterPushDown,
+use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{
+    ColumnStatistics, Constraint, Constraints, DFSchema, ResolvedTableReference, Statistics,
+    internal_datafusion_err, plan_datafusion_err, plan_err,
 };
-use datafusion::physical_expr;
+use datafusion::datasource::TableType;
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{ColumnDef, LockType};
-use datafusion::sql::unparser::Unparser;
-use datafusion::sql::unparser::dialect::MySqlDialect;
-use log::trace;
-use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, TxOpts};
-use rand::{RngCore, rng};
+use datafusion::{logical_expr, physical_expr};
+use log::{trace, warn};
+use mysql_async::Conn;
+use mysql_async::prelude::{FromRow, Queryable};
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::borrow::Cow;
-use std::fmt::{Display, Formatter};
-use std::iter;
 use std::iter::once;
+use std::mem;
+use std::ops::DerefMut;
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub enum ColumnDefault {
@@ -63,158 +68,235 @@ pub enum ColumnDefault {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct MySqlTableProvider {
-    pub(crate) table_reference: TableReference,
-    table_type: TableType,
-    table_schema: SchemaRef,
+pub struct MySqlTableProvider {
+    table_reference: ResolvedTableReference,
     pub(crate) columns_defaults: FxHashMap<String, ColumnDefault>,
+
+    table_schema: SchemaRef,
     encryption_metadata: EncryptedTableMeta,
-
     constraints: Constraints,
+
     primary_key: Vec<ColumnName>,
+    primary_key_def: Vec<ColumnDef>,
 
-    indexable_column: Option<Field>,
-    indexable_column_type: IndexableColumn,
+    statistics: Arc<RwLock<Arc<TableStatistics>>>,
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
-pub enum IndexableColumnSize {
-    B8,
-    B16,
-    B32,
-    B64,
-    B96,
-    B128,
+#[derive(Debug)]
+pub struct TableStatistics {
+    /// Set to true if a task is already in the process of updating this entry
+    update_signal: AtomicBool,
+
+    table_reference: ResolvedTableReference,
+    last_update: Instant,
+    num_rows: Precision<usize>,
+    indexing_columns: FxHashMap<String, Precision<usize>>,
 }
 
-impl IndexableColumnSize {
-    fn bytes(&self) -> usize {
-        match self {
-            IndexableColumnSize::B8 => 1,
-            IndexableColumnSize::B16 => 2,
-            IndexableColumnSize::B32 => 4,
-            IndexableColumnSize::B64 => 8,
-            IndexableColumnSize::B96 => 12,
-            IndexableColumnSize::B128 => 16,
+#[derive(Debug, FromRow)]
+#[mysql(rename_all = "UPPERCASE")]
+struct MySqlIndexStats {
+    column_name: String,
+    cardinality: usize,
+}
+
+#[derive(Debug, FromRow)]
+#[mysql(rename_all = "UPPERCASE")]
+struct MySqlTableStats {
+    table_rows: usize,
+}
+
+impl TableStatistics {
+    const REFRESH_FREQ: Duration = Duration::from_hours(4);
+
+    pub fn for_empty_table(table_reference: ResolvedTableReference) -> Self {
+        Self {
+            last_update: Instant::now(),
+            indexing_columns: FxHashMap::default(),
+            num_rows: Precision::Absent,
+            update_signal: AtomicBool::new(false),
+            table_reference,
         }
     }
 
-    pub fn random_value(&self) -> Vec<u8> {
-        let mut vec = vec![0u8; self.bytes()];
-        rng().fill_bytes(&mut vec);
-        vec
+    #[inline(always)]
+    pub async fn new(
+        table_reference: ResolvedTableReference,
+        conn: &mut Conn,
+    ) -> datafusion::common::Result<Self> {
+        Self::build_for_table(table_reference, conn).await
     }
-}
 
-const GENERATED_INDEXABLE_COLUMN_NAME: &str = "__fusionindex";
+    pub async fn refresh_if_needed(
+        &self,
+        conn: &SessionConfig,
+    ) -> datafusion::common::Result<Option<Self>> {
+        if Instant::now().duration_since(self.last_update) > Self::REFRESH_FREQ {
+            let should_update = self.update_signal.swap(true, Ordering::Relaxed);
+            if !should_update {
+                return Ok(None);
+            }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub enum IndexableColumn {
-    /// The indexable column is generated randomly
-    RandomGenerated(IndexableColumnSize),
-
-    /// The indexable column is a native SQL column, without any auto-generation
-    /// It must be the unique primary key of the table
-    UserProvided(IndexableColumnSize),
-}
-
-impl IndexableColumn {
-    /// Returns true if this indexable column is generated by the proxy when inserting the value
-    pub fn is_generated(&self) -> bool {
-        match self {
-            IndexableColumn::RandomGenerated(_) => true,
-            IndexableColumn::UserProvided(_) => false,
+            let conn = conn.get_conn();
+            let mut locked_conn = conn.lock().await;
+            match Self::build_for_table(self.table_reference.clone(), locked_conn.deref_mut()).await
+            {
+                Ok(value) => Ok(Some(value)),
+                Err(e) => {
+                    self.update_signal.store(false, Ordering::Relaxed);
+                    Err(e)
+                }
+            }
+        } else {
+            Ok(None)
         }
     }
 
-    pub fn size(&self) -> IndexableColumnSize {
-        match self {
-            IndexableColumn::RandomGenerated(s) | IndexableColumn::UserProvided(s) => *s,
+    pub fn column_stats(&self, col: &str) -> Option<Precision<usize>> {
+        self.indexing_columns.get(col).copied()
+    }
+
+    pub fn column_selectivity(&self, col: &str) -> Option<f64> {
+        self.column_stats(col)
+            .and_then(|v| v.get_value().copied())
+            .map(|v| 1f64.min(1f64 / v as f64))
+    }
+
+    pub fn num_rows(&self) -> Precision<usize> {
+        self.num_rows
+    }
+
+    pub async fn build_for_table(
+        table: ResolvedTableReference,
+        conn: &mut Conn,
+    ) -> datafusion::common::Result<Self> {
+        let index_stats = conn.query::<MySqlIndexStats, _>(format!(
+            "SELECT COLUMN_NAME, CARDINALITY FROM INFORMATION_SCHEMA.STATISTICS WHERE table_schema='{}' AND table_name='{}'",
+            table.schema,
+            table.table
+        )).await.map_err(|_| plan_datafusion_err!("failed to retrieve index statistics from server (for {table})"))?;
+
+        let table_stats = conn.query::<MySqlTableStats, _>(format!(
+            "SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE table_schema='{}' AND table_name='{}'",
+            table.schema,
+            table.table
+        )).await.map_err(|_| plan_datafusion_err!("failed to retrieve tables statistics from server (for {table})"))?;
+
+        if table_stats.len() > 1 {
+            plan_err!("failed to retrieve statistics from server (for {table})")?;
         }
+
+        let num_rows =
+            Precision::Inexact(table_stats.get(0).map(|v| v.table_rows).unwrap_or_default());
+
+        // TODO: actually, we should transform blind index columns to the real column that they index?
+        let indexing_columns = index_stats
+            .into_iter()
+            .map(|stat| (stat.column_name, Precision::Inexact(stat.cardinality)))
+            .collect();
+        let last_update = Instant::now();
+
+        Ok(Self {
+            num_rows,
+            indexing_columns,
+            last_update,
+            table_reference: table,
+            update_signal: AtomicBool::new(false),
+        })
+    }
+
+    fn to_df_stats(&self, schema: SchemaRef) -> Statistics {
+        let mut stats = Statistics::default().with_num_rows(self.num_rows);
+
+        for col in schema.fields().iter() {
+            let column_stats = self
+                .indexing_columns
+                .get(col.name())
+                .map(|cardinality| ColumnStatistics::default().with_distinct_count(*cardinality));
+
+            stats = stats.add_column_statistics(column_stats.unwrap_or_default());
+        }
+
+        stats
     }
 }
 
 impl MySqlTableProvider {
-    pub fn get_indexable_column_type(&self) -> IndexableColumn {
-        self.indexable_column_type
+    pub fn try_get_row_id_column(&self) -> datafusion::common::Result<&RowIdColumn> {
+        self.get_row_id_column()
+            .ok_or_else(|| plan_datafusion_err!("table must have a row_id column"))
     }
 
-    pub fn get_indexable_column(&self) -> Option<Field> {
-        if self.get_indexable_column_type().is_generated() {
-            self.indexable_column.clone()
+    pub fn get_row_id_column(&self) -> Option<&RowIdColumn> {
+        self.encryption_metadata.row_id_column.as_ref()
+    }
+
+    pub fn get_row_id_field(&self) -> Option<Field> {
+        self.get_row_id_column().map(|col| col.field())
+    }
+
+    /// Returns a plan that, when executed, creates the rowId column for this table
+    pub async fn create_rowid_column(
+        &self,
+        session: &dyn Session,
+    ) -> datafusion::common::Result<Option<(Arc<dyn ExecutionPlan>, RowIdColumn)>> {
+        if self.get_row_id_column().is_some() {
+            return Ok(None);
+        }
+
+        let projected_pk: Vec<_> = self.primary_key_def.iter().collect();
+        let (column, column_def) = RowIdColumn::create_for_table(&projected_pk)?;
+        let Some(column_def) = column_def else {
+            // TODO: handle updating the metadata
+            plan_err!(
+                "inconsistent metadata state: row_id column exists in table but not in metadata"
+            )?
+        };
+
+        let plan =
+            CreateRowidPlan::create_row_id(self, session, column.clone(), column_def).await?;
+
+        Ok(Some((plan, column)))
+    }
+
+    /// Returns a vector of expressions that can be passed to the ComputeAad function to compute the
+    /// associated data for a row.
+    pub fn get_aad_source(&self) -> Vec<Expr> {
+        if !self.encryption_metadata.row_binding_aad {
+            vec![]
         } else {
-            assert_eq!(self.primary_key.len(), 1);
-            let field = self
-                .table_schema
-                .field_with_name(&self.primary_key[0])
-                .expect("primary key must exist");
-            Some(field.clone())
+            self.primary_key
+                .iter()
+                .map(|column_name| logical_expr::col(column_name))
+                .collect()
         }
     }
 
-    pub async fn create_indexable_column(
-        &mut self,
-        conn: &mut Conn,
-    ) -> datafusion::common::Result<()> {
-        let column_type = self.get_indexable_column_type();
-        if !column_type.is_generated() {
-            panic!("Cannot create a non generated indexable column - it should already exist")
+    /// Returns a vector of expressions that can be passed to the ComputeAad function to compute the
+    /// associated data for a row.
+    pub fn get_aad_source_physical(
+        &self,
+        schema: &Schema,
+        prefix: Option<&str>,
+    ) -> datafusion::common::Result<Vec<Arc<dyn PhysicalExpr>>> {
+        if !self.encryption_metadata.row_binding_aad {
+            Ok(vec![])
+        } else if let Some(prefix) = prefix {
+            self.primary_key
+                .iter()
+                .map(|column_name| {
+                    physical_expr::expressions::col(
+                        format!("{prefix}{column_name}").as_ref(),
+                        schema,
+                    )
+                })
+                .collect()
+        } else {
+            self.primary_key
+                .iter()
+                .map(|column_name| physical_expr::expressions::col(column_name, schema))
+                .collect()
         }
-
-        let table_ref = format!(
-            "{}.{}",
-            self.table_reference.schema().unwrap(),
-            self.table_reference.table()
-        );
-
-        let mut txn = conn
-            .start_transaction(TxOpts::new())
-            .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
-        // 1. Create the column with an index
-        txn.query_drop(format!(
-            "ALTER TABLE {table_ref} \
-                ADD COLUMN {GENERATED_INDEXABLE_COLUMN_NAME} BINARY({}) NULL,\
-                ADD UNIQUE INDEX ({GENERATED_INDEXABLE_COLUMN_NAME})",
-            column_type.size().bytes()
-        ))
-        .await
-        .map_err(|e| {
-            DataFusionError::Execution(format!("Failed to create the indexable column: {e}"))
-        })?;
-
-        // 2. Fill it with random values
-        txn.query_drop(format!(
-            "UPDATE {table_ref} SET {GENERATED_INDEXABLE_COLUMN_NAME} = RANDOM_BYTES({})",
-            column_type.size().bytes()
-        ))
-        .await
-        .map_err(|e| {
-            DataFusionError::Execution(format!("Failed to fill the indexable column: {e}"))
-        })?;
-
-        // 3. Set it NOT NULL
-        txn.query_drop(format!(
-            "ALTER TABLE {table_ref} MODIFY {GENERATED_INDEXABLE_COLUMN_NAME} BINARY({}) NOT NULL",
-            column_type.size().bytes()
-        ))
-        .await
-        .map_err(|e| {
-            DataFusionError::Execution(format!("Failed to create the indexable column: {e}"))
-        })?;
-
-        txn.commit()
-            .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
-        self.indexable_column = Some(Field::new(
-            GENERATED_INDEXABLE_COLUMN_NAME,
-            DataType::Binary,
-            false,
-        ));
-
-        Ok(())
     }
 
     // TODO: When initializing the table, ensure the column is present and set in metadata
@@ -308,27 +390,13 @@ impl MySqlTableProvider {
         })
     }
 
-    /// Returns a list of all tables that are related to this tables, for example index tables.
-    pub fn linked_table_names(&self) -> Vec<String> {
-        self.encryption_metadata
-            .indices()
-            .iter()
-            .flat_map(|index| index.linked_table_names())
-            .collect()
-    }
-
     pub(crate) fn from_columns(
-        table_reference: TableReference,
+        table_reference: ResolvedTableReference,
         columns: Vec<ColumnDef>,
         primary_key: Vec<ColumnName>,
         encryption_metadata: Option<EncryptedTableMeta>,
+        statistics: TableStatistics,
     ) -> Self {
-        // Remove catalog from table reference
-        let table_reference = match table_reference {
-            TableReference::Full { table, schema, .. } => TableReference::Partial { table, schema },
-            other => other,
-        };
-
         // Determine primary keys
         let constraints = if primary_key.is_empty() {
             Vec::new()
@@ -349,18 +417,19 @@ impl MySqlTableProvider {
         };
         let constraints = Constraints::new_unverified(constraints);
 
-        let (indexable_column, columns) = columns
-            .into_iter()
-            .partition::<Vec<_>, _>(|item| &item.name.value == GENERATED_INDEXABLE_COLUMN_NAME);
+        let projected_primary_key: Vec<_> = primary_key
+            .iter()
+            .filter_map(|col_name| columns.iter().find(|col| &col.name.value == col_name))
+            .cloned()
+            .collect();
 
         // Build schema
-        let schema =
-            Self::build_schema(table_reference.table(), &columns, &encryption_metadata).unwrap();
-
-        // Build indexable column if present
-        let indexable_column = indexable_column
-            .first()
-            .and_then(|col| ArrowDatatypeConverter.column_to_field(col).ok());
+        let schema = Self::build_schema(
+            table_reference.table.as_ref(),
+            &columns,
+            &encryption_metadata,
+        )
+        .unwrap();
 
         let defaults = columns
             .iter()
@@ -403,8 +472,13 @@ impl MySqlTableProvider {
         let mut encryption_metadata =
             encryption_metadata.unwrap_or_else(|| EncryptedTableMeta::new());
 
-        let indexable_column_type = compute_expected_indexable_column_type(&full_primary_key);
-        encryption_metadata.set_indexable_column(indexable_column_type);
+        if encryption_metadata.row_binding_aad && !supports_aad_binding(&full_primary_key) {
+            warn!(
+                "Disabled `row_binding_aad` on table {table_reference}: primary key is not deterministic"
+            );
+            encryption_metadata.row_binding_aad = false;
+        }
+
         // TODO: verify this is in adequation with the actual column type...
         // TODO: This whole metadata initialization is a complete mess and should be refactored
 
@@ -416,28 +490,13 @@ impl MySqlTableProvider {
         Self {
             columns_defaults: defaults,
             table_schema: SchemaRef::new(schema),
-            table_type: TableType::Base,
             table_reference,
             constraints,
             encryption_metadata,
             primary_key,
-            indexable_column,
-            indexable_column_type,
+            primary_key_def: projected_primary_key,
+            statistics: Arc::new(RwLock::new(Arc::new(statistics))),
         }
-    }
-
-    pub(crate) fn is_column_encrypted(&self, col: &Column) -> bool {
-        // If relation is present, verify it
-        if col.relation.is_some()
-            && col
-                .relation
-                .as_ref()
-                .is_none_or(|inner| inner.table() != self.table_reference.table())
-        {
-            return false;
-        }
-
-        self.is_encrypted(&col.name)
     }
 
     #[allow(unused)]
@@ -472,13 +531,13 @@ impl MySqlTableProvider {
             .any(|index| index.requires_external_storage())
     }
 
-    pub(crate) fn is_encrypted(&self, col_name: &ColumnName) -> bool {
+    pub(crate) fn is_encrypted(&self, col_name: &str) -> bool {
         self.get_column_metadata(col_name).is_some()
     }
 
     pub(crate) fn get_column_metadata(
         &self,
-        col_name: &ColumnName,
+        col_name: &str,
     ) -> Option<&metadata::EncryptedColumnMeta> {
         self.encryption_metadata.column(col_name)
     }
@@ -496,48 +555,9 @@ impl MySqlTableProvider {
         &mut self.encryption_metadata
     }
 
-    fn filter_supported_for_expr(
-        &self,
-        expr: &Expr,
-    ) -> datafusion::common::Result<TableProviderFilterPushDown> {
-        let mut output = TableProviderFilterPushDown::Exact;
-
-        expr.apply(|expr| match expr {
-            Expr::Column(col) => {
-                if let Some(relation) = col.relation.as_ref() {
-                    if relation.table() != self.table_reference.table()
-                        || relation.schema().is_some_and(|schema| {
-                            self.table_reference
-                                .schema()
-                                .is_some_and(|self_schema| schema != self_schema)
-                        })
-                    {
-                        output = TableProviderFilterPushDown::Unsupported;
-                        return Ok(TreeNodeRecursion::Stop);
-                    }
-                }
-
-                // Is the column in the schema?
-                if self.schema().column_with_name(col.name()).is_none() {
-                    output = TableProviderFilterPushDown::Unsupported;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-
-                // For a column, we always report Partial if it's an encrypted column
-                if self.is_column_encrypted(col) {
-                    output = TableProviderFilterPushDown::Inexact
-                };
-                Ok(TreeNodeRecursion::Continue)
-            }
-            Expr::ScalarSubquery(_) | Expr::InSubquery(_) | Expr::Exists(_) => {
-                // TODO: some queries we may actually be able to forward... Check if any node is an extension?
-                output = TableProviderFilterPushDown::Unsupported;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            _ => Ok(TreeNodeRecursion::Continue),
-        })?;
-
-        Ok(output)
+    #[inline(always)]
+    pub fn index_resolver<'a>(&'a self) -> IndexResolver<'a> {
+        IndexResolver::from(self)
     }
 
     pub async fn scan_and_decrypt_all(
@@ -552,20 +572,21 @@ impl MySqlTableProvider {
             .iter()
             .map(|field| {
                 self.get_column_metadata(field.name()).map(|col_meta| {
-                    crypto::encrypted_column_meta::EncryptedColumnMeta {
-                        table: self.table_reference.table().to_string(),
-                        column: field.name().clone(),
-                        original_type: col_meta.original_type.clone(),
-                    }
+                    (
+                        Arc::<str>::from(field.name().clone()),
+                        col_meta.original_type.clone(),
+                    )
                 })
             })
             .collect::<Vec<_>>();
 
         let keys_manager = state.config().get_long_term_keys_manager();
         let decrypt_projection = project_decrypt(
+            self.table_reference(),
             &projection,
             encrypted_column_meta.as_slice(),
             keys_manager.as_ref(),
+            self.get_aad_source_physical(&projection, None)?,
         )?;
 
         let base_plan = self
@@ -575,6 +596,21 @@ impl MySqlTableProvider {
         Ok(Arc::new(plan))
     }
 
+    async fn refresh_stats(&self, conn: &SessionConfig) -> datafusion::common::Result<()> {
+        let stats = {
+            let lock = self.statistics.read().expect("statistics poisoned");
+            Arc::clone(&lock)
+        };
+
+        if let Some(new_stats) = stats.refresh_if_needed(conn).await? {
+            drop(stats);
+            let mut guard = self.statistics.write().expect("statistics poisoned");
+            drop(mem::replace(&mut *guard, Arc::new(new_stats)));
+        }
+
+        Ok(())
+    }
+
     pub async fn scan_with_schema(
         &self,
         state: &dyn Session,
@@ -582,89 +618,62 @@ impl MySqlTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.refresh_stats(state.config()).await?;
+
         let projection = self.transform_encrypted_fields(projection);
         let projected_schema = SchemaRef::new(projection);
+        let key_manager = state.config().get_long_term_keys_manager();
 
         trace!("Scan {:?} with filters: {filters:?}", &self.table_reference);
 
-        let (forwarded_filters, other_filters) = filters
-            .iter()
-            .cloned()
-            .map(|filt| {
-                let support_level = self
-                    .filter_supported_for_expr(&filt)
-                    .unwrap_or(TableProviderFilterPushDown::Unsupported);
-                (filt, support_level)
-            })
-            .partition::<Vec<_>, _>(|(_, support)| support == &TableProviderFilterPushDown::Exact);
+        let ResolveIndexResult {
+            forwarded_static,
+            forwarded_dynamic,
+            #[allow(unused)]
+            index_selectivity,
+            ..
+        } = self
+            .index_resolver()
+            .resolve_indices_for_logical_filters(&key_manager, filters)?;
 
-        // TODO: (exact) OR (inexact) should be forwarded if we have a filter for the inexact part (otherwise it's useless)
+        let static_filter = forwarded_static.into_iter().reduce(|l, r| l.and(r));
 
-        let (mut forwarded_filters, _): (Vec<Expr>, Vec<_>) = forwarded_filters.into_iter().unzip();
+        let self_reference = state
+            .config()
+            .mysql_schema_for_ref(&TableReference::from(self.table_reference.clone()))
+            .expect("unregistered mysql table provider called??");
 
-        // TODO: we must insert an index filter when we can
+        let statistics = match self.statistics() {
+            Some(mut stats) => {
+                let project = projected_schema
+                    .fields()
+                    .iter()
+                    .filter_map(|field| {
+                        self.table_schema
+                            .column_with_name(field.name())
+                            .map(|(index, _)| index)
+                    })
+                    .collect::<Vec<usize>>();
 
-        let key_manager = state.config().get_long_term_keys_manager();
-        let mut dynamic_filters = vec![];
-
-        if self.has_indices() {
-            let (mut remaining_filters, _): (Vec<_>, Vec<_>) = other_filters.into_iter().unzip();
-            // TODO: would be interesting to re-feed accepted filters to other indices, in case we have complex boolean trees
-
-            for index in self.encryption_metadata.indices() {
-                if remaining_filters.is_empty() {
-                    break;
+                if !matches!(index_selectivity, Precision::Absent) {
+                    // todo: find better rules to be able to use this effectively...
+                    // sadly, in some cases, taking these stats into account can actually worsen the results :(
+                    stats = stats.with_num_rows(index_selectivity);
                 }
 
-                let (mut index_filters, other) = remaining_filters
-                    .into_iter()
-                    .partition(|filter| index.supports_expression(filter));
-                remaining_filters = other;
-
-                let new_filter = Arc::clone(index).query(
-                    &self,
-                    key_manager.clone(),
-                    index_filters.as_slice(),
-                )?;
-
-                if let Some(new_filter) = new_filter {
-                    match new_filter {
-                        IndexQueryStrategy::AddFilterExpression(expr) => {
-                            forwarded_filters.push(expr);
-                        }
-                        IndexQueryStrategy::AddDynamicFilterExpression(expr, dynamic_expr) => {
-                            forwarded_filters.push(expr);
-                            dynamic_filters.push(dynamic_expr);
-                        }
-                    }
-                } else {
-                    // No index returned, we re-add the filters in case we can find another one later
-                    remaining_filters.append(&mut index_filters);
-                }
+                stats.project(Some(&project))
             }
-        }
-
-        let query_builder = Unparser::new(&MySqlDialect {});
-        let static_filter = forwarded_filters.into_iter().reduce(|l, r| {
-            Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(l),
-                right: Box::new(r),
-                op: Operator::And,
-            })
-        });
-
-        let static_filter = if let Some(static_filter) = static_filter {
-            Some(query_builder.expr_to_sql(&static_filter)?)
-        } else {
-            None
+            None => Statistics::new_unknown(projected_schema.as_ref()),
         };
 
         let plan: Arc<dyn ExecutionPlan> = Arc::new(MySqlScanPlan::new_from_schema(
-            &(self.table_reference.clone().resolve("", "")),
+            self_reference,
             projected_schema.clone(),
             limit,
             static_filter,
-            dynamic_filters,
+            forwarded_dynamic,
+            key_manager,
+            statistics,
         ));
 
         Ok(plan)
@@ -691,6 +700,10 @@ impl MySqlTableProvider {
     pub fn update_schema(&mut self, schema: SchemaRef) {
         self.table_schema = schema;
     }
+
+    pub fn table_reference(&self) -> &ResolvedTableReference {
+        &self.table_reference
+    }
 }
 
 // TODO:
@@ -714,7 +727,7 @@ impl TableProvider for MySqlTableProvider {
     }
 
     fn table_type(&self) -> TableType {
-        self.table_type
+        TableType::Base
     }
 
     fn get_table_definition(&self) -> Option<&str> {
@@ -758,11 +771,12 @@ impl TableProvider for MySqlTableProvider {
 
         // We have a single schema here, so all filters should be pushable
         // TODO: ok, the `Inexact` filter is great for encrypted stuff!
+        let resolver = self.index_resolver();
         filters
             .iter()
             .map(|&filter| {
                 if self.has_encrypted_columns() {
-                    let out = self.filter_supported_for_expr(filter);
+                    let out = resolver.filter_supported_for_expr(filter);
 
                     trace!("Filter pushdown [{out:?}]: {filter:?}");
 
@@ -776,7 +790,8 @@ impl TableProvider for MySqlTableProvider {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        None // TODO: we can get these stats from the SQL server at startup
+        let stats = self.statistics.try_read().ok()?;
+        Some(stats.to_df_stats(self.schema()))
     }
 
     async fn insert_into(
@@ -788,22 +803,27 @@ impl TableProvider for MySqlTableProvider {
         // TODO: verify that the input schema is respected (in particular non null values)
 
         // If there is an indexable column, it must be added first so that it is accessible to all indices managed later on
-        let input = if let Some(idx) = self.indexable_column.as_ref() {
-            let expression = GenerateRandomValue(self.indexable_column_type.size());
+        let input = if let Some(row_id) = self.get_row_id_column()
+            && row_id.is_hidden()
+        {
+            let key_manager = state.config().get_long_term_keys_manager();
+            let generator = key_manager.get_identifier_generator(&IdentifierContext::RowIdColumn {
+                table_context: self.table_reference.clone(),
+            });
+            let gen_rowid = row_id
+                .compute_rowid(generator, input.schema().as_ref())?
+                .ok_or(plan_datafusion_err!("failed to generate row_id"))?;
+
             let project_add_indexable_column = input
                 .schema()
                 .fields()
                 .iter()
                 .enumerate()
                 .map(|(idx, field)| {
-                    let base =
-                        datafusion::physical_expr::expressions::Column::new(field.name(), idx);
+                    let base = physical_expr::expressions::Column::new(field.name(), idx);
                     ProjectionExpr::new(Arc::new(base), field.name().clone())
                 })
-                .chain(iter::once(ProjectionExpr::new(
-                    Arc::new(expression),
-                    idx.name().to_string(),
-                )))
+                .chain(once(gen_rowid))
                 .collect::<Vec<_>>();
 
             Arc::new(ProjectionExec::try_new(
@@ -850,6 +870,15 @@ impl MySqlTableProvider {
         Ok(Arc::new(exec))
     }
 
+    pub(crate) fn get_table_statistics(&self) -> datafusion::common::Result<Arc<TableStatistics>> {
+        let lock = self
+            .statistics
+            .read()
+            .map_err(|_| internal_datafusion_err!("poisoned table statistics lock"))?;
+
+        Ok(Arc::clone(&lock))
+    }
+
     pub async fn update(
         &self,
         state: &dyn Session,
@@ -859,50 +888,28 @@ impl MySqlTableProvider {
 
         // If we have a generated indexable column, add it to the underlying select plan
         // This cannot be done at logical planning because the indexable column is "invisible".
-        let input = if self.get_indexable_column_type().is_generated() && self.has_index_storage() {
-            let Some(indexable_column) = self.get_indexable_column() else {
-                plan_err!("table must have an indexable column")?
-            };
-
-            let indexable_column = Arc::new(indexable_column);
-            let table_ref = self.table_reference.clone().resolve("", "");
-            let alias = format!("{CURRENT_VALUE_PREFIX}{GENERATED_INDEXABLE_COLUMN_NAME}");
+        let input = if self.has_index_storage()
+            && let Some(indexable_column) = self.get_row_id_column().filter(|col| col.is_hidden())
+        {
+            let table_ref = self.table_reference.clone();
+            let alias = format!("{CURRENT_VALUE_PREFIX}{}", indexable_column.name());
 
             input
                 .transform_up(|node| {
                     let node_ref = node.as_ref().as_any();
-
-                    if node_ref.is::<MySqlScanPlan>() {
-                        let Some(plan) = node_ref.downcast_ref::<MySqlScanPlan>() else {
-                            unreachable!()
-                        };
-
-                        // We want to insert the column to an existing plan...
+                    if let Some(plan) = node_ref.downcast_ref::<MySqlScanPlan>() {
                         let mut plan = plan.clone();
                         plan.add_select_column(
                             &table_ref,
-                            Arc::clone(&indexable_column),
-                            Some(&alias),
+                            Arc::new(indexable_column.field()),
+                            Some(alias.clone()),
                         );
-
                         Ok(Transformed::yes(Arc::new(plan)))
-                    } else if node_ref.is::<ProjectionExec>() {
-                        let Some(plan) = node_ref.downcast_ref::<ProjectionExec>() else {
-                            unreachable!()
-                        };
-
-                        let added_column = plan.input().schema().index_of(&alias)?;
-                        let added_column = datafusion::physical_expr::expressions::Column::new(
-                            &alias,
-                            added_column,
-                        );
-                        let add_project =
-                            ProjectionExpr::new(Arc::new(added_column), alias.clone());
-
+                    } else if let Some(plan) = node_ref.downcast_ref::<ProjectionExec>() {
+                        let added_column = col(alias.as_str(), plan.input().schema().as_ref())?;
+                        let add_project = ProjectionExpr::new(added_column, alias.clone());
                         let projections = plan.expr().iter().cloned().chain(once(add_project));
-
                         let project = ProjectionExec::try_new(projections, plan.input().clone())?;
-
                         Ok(Transformed::yes(Arc::new(project)))
                     } else {
                         Ok(Transformed::no(node))
@@ -1019,27 +1026,36 @@ impl MySqlTableProvider {
             .fields()
             .iter()
             .map(|field| {
-                self.get_column_metadata(field.name()).map(|meta| {
+                let field_name: Arc<str> =
+                    if let Some(name) = field.name().strip_prefix(DUPLICATE_VALUE_PFX) {
+                        name
+                    } else {
+                        field.name().as_str()
+                    }
+                    .to_string()
+                    .into();
+
+                self.get_column_metadata(field_name.as_ref()).map(|meta| {
                     let cipher = key_manager.get_cipher(&CipherContext::TableColumn {
-                        table_name: self.table_reference.table(),
-                        column_name: field.name(),
+                        table_context: self.table_reference.clone(),
+                        column_name: field_name.clone(),
                     });
-                    let aad = AssociatedData::column_with_type(
-                        self.table_reference.table(),
-                        field.name(),
-                        &meta.original_type,
-                    );
-                    (cipher, aad)
+                    (cipher, meta.original_type.clone())
                 })
             })
             .collect::<Vec<_>>();
 
         // Project layer 1:
         // - cleartext: do nothing
-        // - encrypted w/ index: binary encode (to same column)
+        // - encrypted w/ index: do nothing
         // - encrypted w/o index: binary encode + encrypt (to same column)
         // Question: could the optimizer detect that we're doing the same op twice in cases 2 & 3 and simplify the logic?
         let input_schema = input.schema();
+        let aad_source = self.get_aad_source_physical(
+            input_schema.as_ref(),
+            if is_update { Some(FILTER_PREFIX) } else { None },
+        )?;
+
         let project_layer_1 = input_schema
             .fields()
             .iter()
@@ -1050,16 +1066,17 @@ impl MySqlTableProvider {
 
                 let expr = match column_meta {
                     None => Arc::new(base) as Arc<dyn PhysicalExpr>,
-                    Some((cipher, aad)) => {
-                        let cast =
-                            Arc::new(ToBinaryExpr::new(Arc::new(base))) as Arc<dyn PhysicalExpr>;
-
+                    Some((cipher, source_type)) => {
                         if requested_cleartext_columns.contains(field.name()) {
                             // Return the column as-is
-                            cast
+                            Arc::new(base)
                         } else {
-                            let decrypt = EncryptExpr::new(cast, cipher.clone(), aad.clone());
-                            Arc::new(decrypt) as Arc<dyn PhysicalExpr>
+                            let aad =
+                                Arc::new(ComputeAadExpr::new(aad_source.clone(), source_type));
+                            let cast = Arc::new(ToBinaryExpr::new(Arc::new(base)))
+                                as Arc<dyn PhysicalExpr>;
+                            let encrypt = EncryptExpr::new(cast, aad, cipher.clone());
+                            Arc::new(encrypt) as Arc<dyn PhysicalExpr>
                         }
                     }
                 };
@@ -1078,7 +1095,7 @@ impl MySqlTableProvider {
         } else {
             // Project layer 2
             // - cleartext w/ index: encode + convert (to new column)
-            // - encrypted w/ index: encrypt source column + convert second column
+            // - encrypted w/ index: encode + encrypt source column + convert second column
             let project_layer_2_base = input_schema
                 .fields()
                 .iter()
@@ -1087,11 +1104,14 @@ impl MySqlTableProvider {
                 .map(|(idx, (field, column_meta))| {
                     let base = Arc::new(physical_expr::expressions::Column::new(field.name(), idx));
                     let expr = match column_meta {
-                        Some((cipher, aad))
+                        Some((cipher, data_type))
                             if requested_cleartext_columns.contains(field.name()) =>
                         {
-                            Arc::new(EncryptExpr::new(base, cipher.clone(), aad.clone()))
-                                as Arc<dyn PhysicalExpr>
+                            let aad = Arc::new(ComputeAadExpr::new(aad_source.clone(), data_type));
+                            let cast = Arc::new(ToBinaryExpr::new(base));
+
+                            let encrypt = EncryptExpr::new(cast, aad, cipher.clone());
+                            Arc::new(encrypt) as Arc<dyn PhysicalExpr>
                         }
                         _ => base as Arc<dyn PhysicalExpr>,
                     };
@@ -1117,54 +1137,5 @@ impl MySqlTableProvider {
         };
 
         Ok((projected_input, insert_schema, additional_sinks))
-    }
-}
-
-#[derive(Debug, Eq, PartialEq, Hash)]
-struct GenerateRandomValue(IndexableColumnSize);
-
-impl Display for GenerateRandomValue {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.fmt_sql(f)
-    }
-}
-
-impl PhysicalExpr for GenerateRandomValue {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn data_type(&self, _input_schema: &Schema) -> datafusion::common::Result<DataType> {
-        Ok(DataType::Binary)
-    }
-
-    fn nullable(&self, _input_schema: &Schema) -> datafusion::common::Result<bool> {
-        Ok(false)
-    }
-
-    fn evaluate(&self, batch: &RecordBatch) -> datafusion::common::Result<ColumnarValue> {
-        let mut builder =
-            BinaryBuilder::with_capacity(batch.num_rows(), batch.num_rows() * self.0.bytes());
-        let mut buffer = vec![0; self.0.bytes()];
-        for _ in 0..batch.num_rows() {
-            rng().fill_bytes(buffer.as_mut_slice());
-            builder.append_value(&buffer);
-        }
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn PhysicalExpr>>,
-    ) -> datafusion::common::Result<Arc<dyn PhysicalExpr>> {
-        Ok(self)
-    }
-
-    fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GenerateRandomValue({})", self.0.bytes())
     }
 }

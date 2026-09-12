@@ -14,14 +14,14 @@
 
 mod config;
 
+#[cfg(feature = "tracing")]
+mod tracing;
+
 use crate::config::{MySqlProxyConfig, load_config};
 use async_trait::async_trait;
-use chacha20poly1305::ChaCha20Poly1305;
 use common::{
     AuthenticationHandler, Backend, Frontend, LoginError, LoginMethod, ProxyImplementation,
 };
-use crypto::LongTermKeyManager;
-use crypto::key_manager::MasterKeyHmacSha256KeyManager;
 use env_logger::Env;
 use mysql_backend::MySqlBackend;
 use mysql_frontend::{MySqlFrontend, MySqlFrontendConfig};
@@ -43,15 +43,27 @@ async fn main() {
 
     let MySqlProxyConfig {
         backend_config,
-        secret_key,
+        crypto_config,
     } = load_config("config.toml");
+
+    #[cfg(feature = "tracing")]
+    let telemetry_server = if let Ok(endpoint) = std::env::var("TRACING_ENDPOINT") {
+        crate::tracing::init_tracing(&endpoint)
+    } else {
+        None
+    };
+
+    #[cfg(feature = "tracing")]
+    if telemetry_server.is_none() {
+        crate::tracing::mute_tracing()
+    }
 
     let backend = DataFusionProxy::new(
         // TODO(database-adaptability)
         MySqlBackend::new(backend_config).await.unwrap(),
-        LongTermKeyManager::new(Box::new(
-            MasterKeyHmacSha256KeyManager::<ChaCha20Poly1305>::from_hex_key(&secret_key),
-        )),
+        crypto_config.init_key_manager(),
+        #[cfg(feature = "tracing")]
+        telemetry_server.is_some(),
     );
     let srv = ProxyServer {
         inner_server: backend,
@@ -69,8 +81,19 @@ async fn main() {
         srv.clone(),
     );
 
+    #[cfg(feature = "tracing")]
+    if let Some(telemetry_server) = telemetry_server {
+        ctrlc::set_handler(move || {
+            log::info!("Sending last telemetry events...");
+            telemetry_server
+                .shutdown_with_timeout(std::time::Duration::from_secs(10))
+                .expect("failed to cleanup telemetry");
+        })
+        .expect("Error setting Ctrl-C handler");
+    }
+
     // Start frontend(s)
-    frontend.start_listening().await;
+    frontend.start_listening();
 }
 
 struct ProxyServer<B: Backend> {

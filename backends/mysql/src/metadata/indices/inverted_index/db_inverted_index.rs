@@ -9,7 +9,6 @@ use common::dml::DML_SCHEMA;
 use common::profile;
 use crypto::cipher::Cipher;
 use crypto::identifiers::StableIdentifiersGenerator;
-use crypto::key_manager::KeyManager;
 use crypto::{CipherContext, IdentifierContext, KeyManagerGetter, LongTermKeyManager};
 use datafusion::arrow::array::{AsArray, RecordBatch};
 use datafusion::arrow::datatypes::GenericBinaryType;
@@ -17,11 +16,12 @@ use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::common::plan_err;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::sqlparser::ast;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use datafusion::sql::sqlparser::ast;
+use datafusion::sql::ResolvedTableReference;
 use futures_util::StreamExt;
 use futures_util::stream::once;
 use log::{error, info, trace};
@@ -56,15 +56,21 @@ pub type IndexedDocumentId<const N: usize> = [u8; N];
 
 pub(super) trait IndexedDocumentExtensions {
     fn as_number_value(&self) -> Option<ast::Value>;
+    fn as_u64(&self) -> Option<u64>;
 }
 
 impl<const N: usize> IndexedDocumentExtensions for IndexedDocumentId<N> {
     fn as_number_value(&self) -> Option<ast::Value> {
+        self.as_u64()
+            .map(|v| ast::Value::Number(v.to_string(), false))
+    }
+
+    fn as_u64(&self) -> Option<u64> {
         if N <= 8 {
             let mut bytes = [0u8; 8];
             bytes[0..N].copy_from_slice(self);
             let num = u64::from_le_bytes(bytes);
-            Some(ast::Value::Number(num.to_string(), false))
+            Some(num)
         } else {
             None
         }
@@ -494,8 +500,8 @@ impl IndexTableRow {
 
 #[derive(Debug)]
 pub struct RawInvertedIndex<const KeySize: usize> {
-    table_name: String,
-    index_name: String,
+    indexed_table: ResolvedTableReference,
+    index_name: Arc<str>,
     index_table_name: String,
 
     cached_state: Mutex<CachedIndexState<KeySize>>,
@@ -735,24 +741,26 @@ trait InvertedIndexCipherExt {
 }
 
 pub(super) trait InvertedIndexGetter {
-    fn table_name(&self) -> &str;
-    fn index_name(&self) -> &str;
+    fn indexed_table(&self) -> &ResolvedTableReference;
+    fn index_name(&self) -> &Arc<str>;
 }
 
 impl<const T: usize> InvertedIndexGetter for RawInvertedIndex<T> {
-    fn table_name(&self) -> &str {
-        &self.table_name
+    fn indexed_table(&self) -> &ResolvedTableReference {
+        &self.indexed_table
     }
-    fn index_name(&self) -> &str {
+
+    fn index_name(&self) -> &Arc<str> {
         &self.index_name
     }
 }
 
 impl<const T: usize> InvertedIndexGetter for DbNextVersionTask<T> {
-    fn table_name(&self) -> &str {
-        &self.table_name
+    fn indexed_table(&self) -> &ResolvedTableReference {
+        &self.indexed_table
     }
-    fn index_name(&self) -> &str {
+
+    fn index_name(&self) -> &Arc<str> {
         &self.index_name
     }
 }
@@ -760,8 +768,8 @@ impl<const T: usize> InvertedIndexGetter for DbNextVersionTask<T> {
 impl InvertedIndexCipherExt for Arc<LongTermKeyManager> {
     fn get_metadata_cipher<T: InvertedIndexGetter>(&self, index: &T) -> Arc<dyn Cipher> {
         self.get_cipher(&CipherContext::VersionedIndexEntry {
-            table_name: index.table_name(),
-            index_name: index.index_name(),
+            table_context: index.indexed_table().clone(),
+            index_name: index.index_name().clone(),
             version_number: None,
         })
     }
@@ -772,8 +780,8 @@ impl InvertedIndexCipherExt for Arc<LongTermKeyManager> {
         version: u64,
     ) -> Arc<dyn Cipher> {
         self.get_cipher(&CipherContext::VersionedIndexEntry {
-            table_name: index.table_name(),
-            index_name: index.index_name(),
+            table_context: index.indexed_table().clone(),
+            index_name: index.index_name().clone(),
             version_number: Some(version),
         })
     }
@@ -784,8 +792,8 @@ impl InvertedIndexCipherExt for Arc<LongTermKeyManager> {
         version: u64,
     ) -> Arc<dyn StableIdentifiersGenerator> {
         self.get_identifier_generator(&IdentifierContext::NamedVersionedIndexInTable {
-            table_name: index.table_name(),
-            index_name: index.index_name(),
+            table_context: index.indexed_table().clone(),
+            index_name: index.index_name().clone(),
             version_number: version,
         })
     }
@@ -797,11 +805,11 @@ fn index_table_name(table_name: &str, index_name: &str) -> String {
 }
 
 impl<const IdSize: usize> RawInvertedIndex<IdSize> {
-    pub fn new(table_name: String, index_name: String) -> Self {
-        let index_table_name = index_table_name(&table_name, &index_name);
+    pub fn new(indexed_table: ResolvedTableReference, index_name: String) -> Self {
+        let index_table_name = index_table_name(&indexed_table.table, &index_name);
         Self {
-            table_name,
-            index_name,
+            indexed_table,
+            index_name: index_name.into(),
             index_table_name,
 
             cached_state: Mutex::new(CachedIndexState {
@@ -1091,7 +1099,7 @@ impl<const IdSize: usize> RawInvertedIndex<IdSize> {
         let mut task_context = DbNextVersionTask::<IdSize> {
             current_version,
             index_table_name: self.index_table_name.clone(),
-            table_name: self.table_name.clone(),
+            indexed_table: self.indexed_table.clone(),
             index_name: self.index_name.clone(),
         };
         let context_clone = context.clone();
@@ -1116,8 +1124,8 @@ impl<const IdSize: usize> RawInvertedIndex<IdSize> {
 
 struct DbNextVersionTask<const IdSize: usize> {
     index_table_name: String,
-    table_name: String,
-    index_name: String,
+    indexed_table: ResolvedTableReference,
+    index_name: Arc<str>,
     current_version: u64,
 }
 
@@ -1525,23 +1533,23 @@ impl<const IdSize: usize> DbNextVersionTask<IdSize> {
 #[derive(Debug)]
 struct DbInitialProvisioningTask<const IdSize: usize> {
     index_table_name: String,
-    table_name: String,
-    index_name: String,
+    indexed_table: ResolvedTableReference,
+    index_name: Arc<str>,
 }
 
 #[derive(Debug)]
 pub struct CreateDbInvertedIndexPlan<const IdSize: usize> {
     task: Arc<DbInitialProvisioningTask<IdSize>>,
     initial_data_source: Option<Arc<dyn ExecutionPlan>>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl<const N: usize> InvertedIndexGetter for DbInitialProvisioningTask<N> {
-    fn table_name(&self) -> &str {
-        &self.table_name
+    fn indexed_table(&self) -> &ResolvedTableReference {
+        &self.indexed_table
     }
 
-    fn index_name(&self) -> &str {
+    fn index_name(&self) -> &Arc<str> {
         &self.index_name
     }
 }
@@ -1550,7 +1558,7 @@ impl<const IdSize: usize> CreateDbInvertedIndexPlan<IdSize> {
     pub const COLUMN_NAME_ID: &str = "row_id";
     pub const COLUMN_NAME_TERMS: &str = "terms";
 
-    pub fn new_empty(table_name: String, index_name: String) -> Self {
+    pub fn new_empty(indexed_table: ResolvedTableReference, index_name: Arc<str>) -> Self {
         let plan_properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&DML_SCHEMA)),
             Partitioning::UnknownPartitioning(1),
@@ -1559,18 +1567,18 @@ impl<const IdSize: usize> CreateDbInvertedIndexPlan<IdSize> {
         );
 
         Self {
-            task: Arc::new(DbInitialProvisioningTask::new(table_name, index_name)),
+            task: Arc::new(DbInitialProvisioningTask::new(indexed_table, index_name)),
             initial_data_source: None,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
     pub fn new_from_data(
-        table_name: String,
-        index_name: String,
+        indexed_table: ResolvedTableReference,
+        index_name: Arc<str>,
         initial_data_source: Arc<dyn ExecutionPlan>,
     ) -> datafusion::common::Result<Self> {
-        let base = Self::new_empty(table_name, index_name);
+        let base = Self::new_empty(indexed_table, index_name);
         base.with_initial_data_source(Some(initial_data_source))
     }
 
@@ -1633,12 +1641,12 @@ impl<const IdSize: usize> CreateDbInvertedIndexPlan<IdSize> {
 }
 
 impl<const IdSize: usize> DbInitialProvisioningTask<IdSize> {
-    fn new(table_name: String, index_name: String) -> Self {
-        let index_table_name = index_table_name(&table_name, &index_name);
+    fn new(indexed_table: ResolvedTableReference, index_name: Arc<str>) -> Self {
+        let index_table_name = index_table_name(&indexed_table.table, &index_name);
         Self {
             index_table_name,
             index_name,
-            table_name,
+            indexed_table,
         }
     }
 
@@ -1852,7 +1860,7 @@ impl<const IdSize: usize> ExecutionPlan for CreateDbInvertedIndexPlan<IdSize> {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

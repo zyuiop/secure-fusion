@@ -1,18 +1,18 @@
+use crate::ast_expr_ext::AstExprExt;
+use crate::filtering::indexable_filter::{IndexSelectivity, IndexableFilterExpr, SupportOptions};
+use crate::filtering::logical::IndexableLogicalExpr;
 use crate::get_catalog::CatalogGetter;
-use crate::get_conn::ConnGetter;
 use crate::metadata::indices::inverted_index::db_inverted_index::{
     CreateDbInvertedIndexPlan, IndexedDocumentExtensions, IndexedDocumentId, InvertedIndexGetter,
     RawIndexQuery, RawIndexTermRef, RawInvertedIndex,
 };
-use crate::metadata::kw_search_func::{KwSearchArgs, KwSearchUdf, SearchMode};
 use crate::metadata::{
-    ColumnName, EncryptedIndex, EncryptedIndexConfigurationVariant, IndexConfig,
+    ColumnName, DynamicFilter, EncryptedIndex, EncryptedIndexConfigurationVariant, IndexConfig,
     IndexInsertStrategy, IndexQueryStrategy, IndexSink, SerializableEncryptedTableMeta,
 };
 use crate::planning::logical::{CURRENT_VALUE_PREFIX, FILTER_PREFIX};
-use crate::planning::physical::plans::mysql_scan_plan::DynamicFilter;
 use crate::providers::schema_provider::MySqlSchemaProvider;
-use crate::providers::table_provider::{IndexableColumn, IndexableColumnSize, MySqlTableProvider};
+use crate::providers::table_provider::MySqlTableProvider;
 use crate::sinks::sink::RecordBatchSink;
 use crate::store::StoreGetter;
 use async_trait::async_trait;
@@ -20,6 +20,7 @@ use bitflags::bitflags;
 use common::dml::DmlResult;
 use crypto::LongTermKeyManager;
 use crypto::planning::physical::to_binary::ToBinaryExpr;
+use crypto::row_id::{RowIdColumn, RowIdColumnSize};
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, GenericByteBuilder, GenericListBuilder, OffsetSizeTrait,
 };
@@ -29,17 +30,14 @@ use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef}
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::{
-    Column, DataFusionError, ResolvedTableReference, ScalarValue, exec_err, plan_err,
+    DataFusionError, ResolvedTableReference, ScalarValue, exec_datafusion_err, exec_err,
+    plan_datafusion_err, plan_err,
 };
 use datafusion::datasource::TableProvider;
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::functions_nested::concat::ArrayConcat;
-use datafusion::logical_expr::expr::Placeholder;
 use datafusion::logical_expr::sqlparser::ast;
-use datafusion::logical_expr::sqlparser::ast::{VisitMut, VisitorMut};
-use datafusion::logical_expr::{
-    BinaryExpr, ColumnarValue, Expr, Operator, ScalarFunctionArgs, ScalarUDFImpl,
-};
+use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion::physical_expr;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::projection::ProjectionExpr;
@@ -47,16 +45,14 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::sql::sqlparser::ast::{BinaryOperator, Ident, Value};
-use datafusion::sql::sqlparser::tokenizer::Span;
 use futures_util::{TryStreamExt, stream};
-use log::{info, trace, warn};
+use log::{trace, warn};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::{fmt, iter};
 
@@ -83,6 +79,7 @@ pub struct InvertedIndex<const KeySize: usize> {
     watched_string_columns: BTreeSet<ColumnName>,
 
     /// A vec (column_name, term_if_true, term_if_false)
+    /// TODO: Ignored for now
     watched_boolean_columns: BTreeMap<ColumnName, (RawIndexTermRef, RawIndexTermRef)>,
 
     /// A vec (condition, term_if_true, term_if_false)
@@ -108,314 +105,170 @@ impl<const KeySize: usize> InvertedIndex<KeySize> {
         &self.all_tracked_columns
     }
 
-    pub fn supports_query(&self, filter_expr: &Expr) -> bool {
-        let parsed = self
-            .parse_expr(filter_expr)
-            .eliminate_unsupported_branches();
-        !matches!(parsed, FilterTree::UnsupportedFilter(_))
+    /// Checks if a tree "leaf" is supported by this filter
+    fn is_supported<T: Clone + Debug>(
+        &self,
+        tree: &IndexableFilterExpr<T>,
+    ) -> Option<IndexSelectivity> {
+        match tree {
+            IndexableFilterExpr::KwSearchLike(column, _)
+                if self.tracked_columns().contains(column.column.name()) =>
+            {
+                Some(IndexSelectivity::Absent)
+            }
+            IndexableFilterExpr::KwMatch { columns, .. }
+                if columns
+                    .iter()
+                    .all(|column| self.tracked_columns().contains(column.name())) =>
+            {
+                Some(IndexSelectivity::Absent)
+            }
+            _ => None,
+        }
     }
 
-    fn parse_expr(&self, expr: &Expr) -> FilterTree {
-        match expr {
-            Expr::Alias(inner) => self.parse_expr(&inner.expr),
-            Expr::Column(c) => {
-                // Only if it's a boolean column!
-                self.get_filter_for_column(c)
-                    .unwrap_or_else(|| FilterTree::UnsupportedFilter(Box::new(expr.clone())))
+    /// Converts an entirely supported tree to an executable filter tree
+    fn parse_filter_tree<T: Clone + Debug>(
+        &self,
+        tree: IndexableFilterExpr<T>,
+    ) -> datafusion::common::Result<ExecutableFilterTree> {
+        match tree {
+            IndexableFilterExpr::And(a, b) => {
+                Ok(self.parse_filter_tree(*a)?.and(self.parse_filter_tree(*b)?))
             }
-
-            Expr::ScalarVariable(_, _) | Expr::Literal(_, _) |
-            Expr::IsUnknown(_) | Expr::Unnest(_) | Expr::Case(_) | Expr::InSubquery(_) |
-            Expr::ScalarSubquery(_) | Expr::OuterReferenceColumn(_, _) | Expr::Wildcard { .. } |
-            Expr::Exists(_) | Expr::WindowFunction(_) | Expr::AggregateFunction(_) |
-            Expr::GroupingSet(_) |
-
-            // Acceptable only as a value
-            Expr::Placeholder(_)
-            => {
-                FilterTree::UnsupportedFilter(Box::new(expr.clone()))
+            IndexableFilterExpr::Or(a, b) => {
+                Ok(self.parse_filter_tree(*a)?.or(self.parse_filter_tree(*b)?))
             }
-
-            expr @ Expr::BinaryExpr(bin) => {
-                // One of the two arms may be a scalar value
-
-                match bin.op {
-                    Operator::And => FilterTree::And(
-                        Box::new(self.parse_expr(&bin.left)),
-                        Box::new(self.parse_expr(&bin.right)),
-                    ),
-                    Operator::Or => FilterTree::Or(
-                        Box::new(self.parse_expr(&bin.left)),
-                        Box::new(self.parse_expr(&bin.right)),
-                    ),
-
-                    Operator::Eq | Operator::NotEq => {
-                        let (left_v, right_v) = (Self::find_value(&bin.left), Self::find_value(&bin.right));
-
-                        let (value, expr) = if let Some(left_v) = left_v {
-                            (left_v, &bin.right)
-                        } else if let Some(right_v) = right_v {
-                            (right_v, &bin.left)
-                        } else {
-                            return self.try_find_tested_expression(expr);
-                        };
-
-                        if value.data_type() == DataType::Boolean {
-                            let inner = self.parse_expr(&expr);
-
-                            if value.eq(&ScalarValue::Boolean(Some(true))) {
-                                inner
-                            } else if value.eq(&ScalarValue::Boolean(Some(false))) {
-                                FilterTree::Not(Box::new(inner))
-                            } else {
-                                // IS NULL
-                                self.try_find_tested_expression(expr)
-                            }
-                        } else {
-                            self.try_find_tested_expression(expr)
-                        }
-                    }
-
-                    _ => self.try_find_tested_expression(expr)
+            IndexableFilterExpr::Not(other) => {
+                // TODO: when we support boolean expressions again
+                /*
+                FilterTree::BooleanExpr { if_false, .. } => {
+                    ExecutableFilterTree::FilterExpr(RawIndexQuery::Term(if_false))
                 }
+                 */
+                Ok(ExecutableFilterTree::Not(Box::new(
+                    self.parse_filter_tree(*other)?,
+                )))
             }
-
-            // TODO: here we should detect keywords and emit the correct tree
-            Expr::Like(v) => {
-                let Some(column) = v.expr.try_as_col() else {
-                    return FilterTree::UnsupportedFilter(Box::new(expr.clone()))
-                };
-                if !self.tracked_columns().contains(column.name()) {
-                    return FilterTree::UnsupportedFilter(Box::new(expr.clone()))
-                }
-
-                let Some(pattern) = v.pattern.as_literal() else {
-                    return FilterTree::UnsupportedFilter(Box::new(expr.clone()))
-                };
-
-                let ScalarValue::Utf8(Some(pattern)) = pattern else {
-                    return FilterTree::UnsupportedFilter(Box::new(expr.clone()))
+            IndexableFilterExpr::KwSearchLike(column, pattern) => {
+                if !self.tracked_columns().contains(column.column.name()) {
+                    plan_err!("unsupported column for inverted index: {column:?}")?
                 };
 
                 let pattern = pattern.replace(['%'], " "); // TODO: better variant here, any special symbol should be excluded
-                let pattern = self.parse_string(&pattern)
+                let pattern = self
+                    .parse_like_string(&pattern)
                     .into_iter()
-                    .map(|term| FilterTree::KwSearch(term))
-                    .reduce(|l, r| FilterTree::And(Box::new(l), Box::new(r)));
+                    .map(|term| RawIndexQuery::Term(term))
+                    .reduce(|l, r| RawIndexQuery::Intersect(Box::new(l), Box::new(r)))
+                    .ok_or(plan_datafusion_err!(
+                        "invalid LIKE expression with no keyword {pattern}"
+                    ))?;
 
-                pattern.unwrap_or_else(|| FilterTree::UnsupportedFilter(Box::new(expr.clone())))
-            },
-            Expr::InList(_) => todo!("kw detection"),
-            Expr::SimilarTo(_) => todo!("kw detection"),
-
-            Expr::ScalarFunction(sf) if sf.func.name() == KwSearchUdf::KW_SEARCH_UDF_NAME => {
-                let Ok(KwSearchArgs { search_columns, search_string, search_mode }) = KwSearchUdf::split_args(&sf.args) else {
-                    return FilterTree::UnsupportedFilter(Box::new(expr.clone()))
+                Ok(ExecutableFilterTree::FilterExpr(pattern))
+            }
+            IndexableFilterExpr::KwMatch {
+                columns,
+                search_string,
+            } => {
+                if let Some(unsupported_column) = columns
+                    .iter()
+                    .find(|column| !self.tracked_columns().contains(column.name()))
+                {
+                    plan_err!("unsupported column for inverted index: {unsupported_column:?}")?
                 };
 
-                // Are the columns supported?
-                let supported_columns = search_columns.iter().all(|column| self.tracked_columns().contains(column.name()));
-                if !supported_columns {
-                    return FilterTree::UnsupportedFilter(Box::new(expr.clone()))
-                }
+                let search_string = if self.collation.contains(Collation::CASE_INSENSITIVE) {
+                    search_string.to_lowercase()
+                } else {
+                    search_string
+                };
 
-                match search_mode {
-                    SearchMode::Boolean => {
-                        let search_string = if self.collation.contains(Collation::CASE_INSENSITIVE) {
-                            search_string.to_lowercase()
+                /*
+                A leading or trailing plus sign indicates that this word must be present in each row that is returned. InnoDB only supports leading plus signs.
+                A leading or trailing minus sign indicates that this word must not be present in any of the rows that are returned. InnoDB only supports leading minus signs.
+                Note: The - operator acts only to exclude rows that are otherwise matched by other search terms. Thus, a boolean-mode search that contains only terms preceded by - returns an empty result. It does not return “all rows except those containing any of the excluded terms.”
+                 */
+                let mut excluded = None;
+                let mut must_be_included = None;
+                let mut can_be_included = None;
+
+                for keyword in search_string.trim().split(' ') {
+                    if let Some(str) = keyword.strip_prefix('-') {
+                        let term = RawIndexQuery::Term(Self::keyword_to_term(str));
+                        excluded = if let Some(initial) = excluded.take() {
+                            Some(RawIndexQuery::Intersect(Box::new(initial), Box::new(term)))
                         } else {
-                            search_string
-                        };
-
-                        let split_q = search_string.trim().split(' ')
-                            .fold(FilterTree::Empty, |filter, keyword| {
-                                // https://dev.mysql.com/doc/refman/8.4/en/fulltext-boolean.html
-                                if let Some(str) = keyword.strip_prefix('+') {
-                                    FilterTree::And(Box::new(filter), Box::new(FilterTree::KwSearch(Self::keyword_to_term(str))))
-                                } else if let Some(str) = keyword.strip_prefix('-') {
-                                    let base = Box::new(FilterTree::KwSearch(Self::keyword_to_term(str)));
-                                    FilterTree::And(Box::new(filter), Box::new(FilterTree::Not(base)))
-                                } else {
-                                    FilterTree::Or(Box::new(filter), Box::new(FilterTree::KwSearch(Self::keyword_to_term(keyword))))
-                                }
-                            });
-
-                        split_q
+                            Some(term)
+                        }
+                    } else if let Some(str) = keyword.strip_prefix('+') {
+                        let term = RawIndexQuery::Term(Self::keyword_to_term(str));
+                        must_be_included = if let Some(initial) = must_be_included.take() {
+                            Some(RawIndexQuery::Intersect(Box::new(initial), Box::new(term)))
+                        } else {
+                            Some(term)
+                        }
+                    } else {
+                        let term = RawIndexQuery::Term(Self::keyword_to_term(keyword));
+                        can_be_included = if let Some(initial) = can_be_included.take() {
+                            Some(RawIndexQuery::Union(Box::new(initial), Box::new(term)))
+                        } else {
+                            Some(term)
+                        }
                     }
                 }
-            }
 
-            Expr::Not(e) | Expr::IsFalse(e) | Expr::IsNotTrue(e) => {
-                // TODO: in practice, these are different semantics (re. null values), but let's for now ignore this
-                let inner = self.parse_expr(&e);
-                FilterTree::Not(Box::new(inner))
-            }
-
-            Expr::IsTrue(e) | Expr::IsNotFalse(e) => {
-                // TODO: in practice, these are different semantics (re. null values), but let's for now ignore this
-                self.parse_expr(&e)
-            }
-
-            expr @ (Expr::IsNotNull(_) | Expr::IsNull(_) | Expr::Negative(_) | Expr::Between(_) | Expr::IsNotUnknown(_) | Expr::ScalarFunction(_)) => {
-                self.try_find_tested_expression(expr)
-            }
-
-            Expr::Cast(inner) => self.parse_expr(&inner.expr),
-            Expr::TryCast(inner) => self.parse_expr(&inner.expr),
-        }
-    }
-
-    fn find_value(expr: &Expr) -> Option<ScalarValue> {
-        match expr {
-            Expr::Literal(lit, _) => Some(lit.clone()),
-
-            Expr::Alias(e) => Self::find_value(&e.expr),
-
-            Expr::Cast(e) => {
-                let v = Self::find_value(&e.expr)?;
-                v.cast_to(&e.data_type).ok()
-            }
-            Expr::TryCast(e) => {
-                let v = Self::find_value(&e.expr)?;
-                v.cast_to(&e.data_type).ok()
-            }
-            Expr::BinaryExpr(binary) => {
-                let left = Self::find_value(&binary.left)?;
-                let right = Self::find_value(&binary.right)?;
-
-                match binary.op {
-                    Operator::Eq => Some(ScalarValue::Boolean(Some(left == right))),
-                    Operator::NotEq => Some(ScalarValue::Boolean(Some(left != right))),
-                    Operator::Lt => Some(ScalarValue::Boolean(Some(left < right))),
-                    Operator::LtEq => Some(ScalarValue::Boolean(Some(left <= right))),
-                    Operator::Gt => Some(ScalarValue::Boolean(Some(left > right))),
-                    Operator::GtEq => Some(ScalarValue::Boolean(Some(left >= right))),
-
-                    _ => todo!("non trivial operations on literals"),
+                if must_be_included.is_none() && can_be_included.is_none() {
+                    // We must have AT LEAST one keyword
+                    plan_err!(
+                        "MATCH ... AGAINST ... must have at least one mandatory (+) or optional ( ) keyword"
+                    )?
                 }
-            }
 
-            // TODO: binary operators between scalar values...
-            _ => None,
-        }
-    }
-
-    fn get_filter_for_column(&self, c: &Column) -> Option<FilterTree> {
-        self.watched_boolean_columns
-            .get(&c.name)
-            .map(|(if_true, if_false)| FilterTree::BooleanExpr {
-                if_true: if_true.clone(),
-                if_false: if_false.clone(),
-            })
-    }
-
-    fn find_boolean_column(&self, expr: &Expr) -> Option<FilterTree> {
-        match expr {
-            Expr::Alias(alias) => self.find_boolean_column(&alias.expr),
-            Expr::Column(c) => self.get_filter_for_column(c),
-            _ => None,
-        }
-    }
-
-    fn try_find_tested_expression(&self, expr: &Expr) -> FilterTree {
-        // Is the expr. a simple column?
-        if let Some(e) = self.find_boolean_column(expr) {
-            return e;
-        }
-
-        // TODO: We may add some heuristics here, for example if we have expr = `col > 12` and we
-        // have a known tested expression `col > 10`, we may insert it (even though it is an imperfect filter)
-
-        /* let found = self.watched_conditions
-        .iter()
-        .find(|(watched_cond, _, _)| Self::is_similar(watched_cond, expr)); */
-
-        /* if let Some((_, if_true, if_false)) = found {
-            FilterTree::BooleanExpr { if_true: if_true.clone(), if_false: if_false.clone() }
-        } else { */
-        FilterTree::UnsupportedFilter(Box::new(expr.clone()))
-        /* } */
-    }
-
-    /* fn is_similar(expr: &Expr, compare_against: &Expr) -> bool {
-        expr == compare_against
-    } */
-
-    pub fn query(
-        self: Arc<Self>,
-        table_ref: &MySqlTableProvider,
-        filter_exprs: &[Expr],
-    ) -> datafusion::common::Result<Option<IndexQueryStrategy>> {
-        trace!("Query index with expressions: {:?}", filter_exprs);
-
-        let mut forward_expressions = Vec::new();
-        let mut executable_expressions = None;
-        let placeholder_pfx = format!(":_idx_{}_", self.inner.index_name());
-
-        for expr in filter_exprs {
-            let parsed = self.parse_expr(expr).simplify();
-
-            info!("Parsed expr: {:?}", parsed);
-
-            if parsed.is_entirely_unsuported() {
-                forward_expressions.push(Box::new(expr.clone()))
-            } else {
-                let parsed = Box::new(parsed);
-                if let Some(executable) = executable_expressions {
-                    executable_expressions = Some(Box::new(FilterTree::And(parsed, executable)))
+                let base = if let Some(must_be_included) = must_be_included {
+                    if let Some(can_be_included) = can_be_included {
+                        // This is not exactly correct but that will do...
+                        RawIndexQuery::Intersect(
+                            Box::new(must_be_included),
+                            Box::new(can_be_included),
+                        )
+                    } else {
+                        must_be_included
+                    }
                 } else {
-                    executable_expressions = Some(parsed)
-                }
+                    can_be_included.expect(
+                        "unreachable: given previous twoconditions, can_be_included is defined",
+                    )
+                };
+
+                Ok(ExecutableFilterTree::FilterExpr(
+                    if let Some(excluded) = excluded {
+                        RawIndexQuery::Difference(Box::new(base), Box::new(excluded))
+                    } else {
+                        base
+                    },
+                ))
             }
+            unsupported => plan_err!("unsupported plan node for inverted index: {unsupported:?}"),
         }
-
-        let replacer = if let Some(executable_expressions) = executable_expressions {
-            let mut visitor = FilterTreeVisitor {
-                queries: Vec::new(),
-                placeholder_pfx,
-            };
-            let executable_expr = executable_expressions
-                .simplify()
-                .to_executable()
-                .simplify()
-                .visit(&mut visitor);
-
-            forward_expressions.push(Box::new(executable_expr));
-
-            let indexable_column = table_ref.get_indexable_column().unwrap();
-
-            let replacer = QueryReplacer::<KeySize> {
-                query: visitor.queries,
-                placeholder_pfx: visitor.placeholder_pfx,
-                id_column: Ident::new(indexable_column.name()),
-                id_column_type: indexable_column.data_type().clone(),
-                index: self.inner.clone(),
-            };
-
-            Some(replacer)
-        } else {
-            None
-        };
-
-        let Some(e) = forward_expressions.into_iter().reduce(|left, right| {
-            Box::new(Expr::BinaryExpr(BinaryExpr {
-                left,
-                right,
-                op: Operator::And,
-            }))
-        }) else {
-            return Ok(None);
-        };
-
-        Ok(Some(match replacer {
-            None => IndexQueryStrategy::AddFilterExpression(*e),
-            Some(replacer) => {
-                IndexQueryStrategy::AddDynamicFilterExpression(*e, Arc::new(replacer))
-            }
-        }))
     }
 
-    fn parse_string(&self, string: &str) -> Vec<RawIndexTermRef> {
+    pub fn query<T: Clone + Debug>(
+        self: Arc<Self>,
+        indexable_column: &RowIdColumn,
+        supported_filter: IndexableFilterExpr<T>,
+    ) -> datafusion::common::Result<IndexQueryStrategy> {
+        trace!("Query index with expressions: {:?}", supported_filter);
+        let executable = self.parse_filter_tree(supported_filter)?.simplify();
+        let replacer = InvertedIndexExec::<KeySize> {
+            query: executable,
+            id_column: indexable_column.field(),
+            index: self.inner.clone(),
+        };
+        Ok(IndexQueryStrategy::Dynamic(Arc::new(replacer)))
+    }
+
+    fn parse_like_string(&self, string: &str) -> Vec<RawIndexTermRef> {
         let string = string.trim();
         let string = if self.collation.contains(Collation::CASE_INSENSITIVE) {
             string.to_lowercase()
@@ -448,188 +301,130 @@ impl<const KeySize: usize> InvertedIndex<KeySize> {
     }
 }
 
-struct QueryReplacer<const KS: usize> {
-    query: Vec<RawIndexQuery>,
-    placeholder_pfx: String,
-    id_column: Ident,
-    id_column_type: DataType,
+struct InvertedIndexExec<const KS: usize> {
+    query: ExecutableFilterTree,
+    id_column: Field,
     index: Arc<RawInvertedIndex<KS>>,
 }
 
-impl<const KS: usize> Debug for QueryReplacer<KS> {
+impl<const KS: usize> Debug for InvertedIndexExec<KS> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "QueryReplacer {{ query: {:?}, placeholder_pfx: {}, id_column: {:?}, id_column_type: {:?}, index: [abridged] }}",
-            self.query, self.placeholder_pfx, self.id_column, self.id_column_type
+            "InvertedIndexExec {{ query: {:?}, id_column: {:?}, index: [abridged] }}",
+            self.query, self.id_column
         )
     }
 }
 
 #[async_trait]
-impl<const KS: usize> DynamicFilter for QueryReplacer<KS> {
+impl<const KS: usize> DynamicFilter for InvertedIndexExec<KS> {
     async fn execute_filter(
         &self,
-        mut filter: ast::Expr,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<ast::Expr> {
-        let results = self
-            .index
-            .query(context.clone(), self.query.clone())
-            .await?;
-        let mut visitor = ResultReplacer::<KS> {
-            placeholder_pfx: self.placeholder_pfx.clone(),
-            id_column: self.id_column.clone(),
-            id_column_type: self.id_column_type.clone(),
-            query_result: results,
-        };
+        let mut queries = vec![];
+        self.query.extract_queries(&mut queries);
 
-        let _ = VisitMut::visit(&mut filter, &mut visitor);
-        Ok(filter)
+        let mut results = self.index.query(context.clone(), queries).await?;
+
+        self.query.to_expr(&self.id_column, &mut results)
     }
 }
 
-struct ResultReplacer<const KS: usize> {
-    placeholder_pfx: String,
-    id_column: ast::Ident,
-    id_column_type: DataType,
-    query_result: Vec<FxHashSet<IndexedDocumentId<KS>>>,
-}
-
-impl<const N: usize> VisitorMut for ResultReplacer<N> {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> ControlFlow<Self::Break> {
-        let ast::Expr::Value(value) = expr else {
-            return ControlFlow::Continue(());
-        };
-        let ast::Value::Placeholder(pl) = &value.value else {
-            return ControlFlow::Continue(());
-        };
-
-        if let Some(suffix) = pl.strip_prefix(self.placeholder_pfx.as_str()) {
-            let Ok(suffix) = suffix.parse::<usize>() else {
-                warn!("Invalid suffix `{suffix}` for placeholder: {pl}");
-                return ControlFlow::Continue(());
-            };
-            let Some(query_result) = self.query_result.get(suffix) else {
-                warn!("No query result for placeholder: {pl}");
-                return ControlFlow::Continue(());
-            };
-
-            let value_is_number = matches!(
-                self.id_column_type,
-                DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::UInt8
-                    | DataType::UInt16
-                    | DataType::UInt32
-                    | DataType::UInt64
-            );
-
-            // Encode as expressions
-            if query_result.len() == 0 {
-                value.value = Value::Boolean(false);
-            } else if query_result.len() == 1 {
-                let result = query_result.into_iter().next().unwrap();
-
-                value.value = if value_is_number {
-                    result.as_number_value().unwrap()
-                } else {
-                    Value::HexStringLiteral(hex::encode(result))
-                };
-
-                *expr = ast::Expr::BinaryOp {
-                    op: BinaryOperator::Eq,
-                    left: Box::new(ast::Expr::Identifier(self.id_column.clone())),
-                    right: Box::new(ast::Expr::Value(value.clone())),
-                };
-            } else {
-                let expr_list = query_result
-                    .into_iter()
-                    .map(|v| {
-                        let result = if value_is_number {
-                            v.as_number_value().unwrap()
-                        } else {
-                            Value::HexStringLiteral(hex::encode(v))
-                        };
-
-                        let value = ast::ValueWithSpan {
-                            value: result,
-                            span: Span::empty(),
-                        };
-                        ast::Expr::Value(value)
-                    })
-                    .collect();
-
-                *expr = ast::Expr::InList {
-                    expr: Box::new(ast::Expr::Identifier(self.id_column.clone())),
-                    negated: false,
-                    list: expr_list,
-                }
-            }
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-#[derive(Eq, PartialEq, Debug, Clone)]
-enum FilterTree {
-    And(Box<FilterTree>, Box<FilterTree>),
-    Or(Box<FilterTree>, Box<FilterTree>),
-    Not(Box<FilterTree>),
-
-    UnsupportedFilter(Box<Expr>),
-
-    // QUESTION: we have two different ways to handle the same problem here
-    // Is it interesting to have an `if_true` term, or in the end, can we handle everything as `NOT IN (...)` ?
-    // Is the added flexibility interesting or not
-    BooleanExpr {
-        if_true: RawIndexTermRef,
-        if_false: RawIndexTermRef,
-    },
-    KwSearch(RawIndexTermRef),
-    Empty,
-}
-
+#[derive(Debug)]
 enum ExecutableFilterTree {
     And(Box<ExecutableFilterTree>, Box<ExecutableFilterTree>),
     Or(Box<ExecutableFilterTree>, Box<ExecutableFilterTree>),
+
     Not(Box<ExecutableFilterTree>),
 
-    UnsupportedFilter(Box<Expr>),
     FilterExpr(RawIndexQuery),
 }
 
-struct FilterTreeVisitor {
-    placeholder_pfx: String,
-    queries: Vec<RawIndexQuery>,
-}
-
 impl ExecutableFilterTree {
-    pub fn visit(self, visitor: &mut FilterTreeVisitor) -> Expr {
+    pub fn and(self, other: Self) -> Self {
+        Self::And(Box::new(self), Box::new(other))
+    }
+
+    pub fn or(self, other: Self) -> Self {
+        Self::Or(Box::new(self), Box::new(other))
+    }
+
+    pub fn extract_queries(&self, queries: &mut Vec<RawIndexQuery>) {
         match self {
-            ExecutableFilterTree::And(a, b) => Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(a.visit(visitor)),
-                right: Box::new(b.visit(visitor)),
-                op: Operator::And,
-            }),
-            ExecutableFilterTree::Or(a, b) => Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(a.visit(visitor)),
-                right: Box::new(b.visit(visitor)),
-                op: Operator::Or,
-            }),
-            ExecutableFilterTree::Not(a) => Expr::Not(Box::new(a.visit(visitor))),
-            ExecutableFilterTree::UnsupportedFilter(f) => *f,
+            ExecutableFilterTree::And(a, b) | ExecutableFilterTree::Or(a, b) => {
+                a.extract_queries(queries);
+                b.extract_queries(queries);
+            }
+            ExecutableFilterTree::Not(a) => {
+                a.extract_queries(queries);
+            }
             ExecutableFilterTree::FilterExpr(f) => {
-                let query_number = visitor.queries.len();
-                visitor.queries.push(f);
-                Expr::Placeholder(Placeholder {
-                    field: None,
-                    id: format!("{}{query_number}", &visitor.placeholder_pfx),
-                })
+                queries.push(f.clone());
+            }
+        }
+    }
+
+    pub fn to_expr<const KS: usize>(
+        &self,
+        id_column: &Field,
+        queries_results: &mut Vec<FxHashSet<IndexedDocumentId<KS>>>,
+    ) -> datafusion::common::Result<ast::Expr> {
+        match self {
+            ExecutableFilterTree::And(a, b) => Ok(a
+                .to_expr(id_column, queries_results)?
+                .and(b.to_expr(id_column, queries_results)?)),
+            ExecutableFilterTree::Or(a, b) => Ok(a
+                .to_expr(id_column, queries_results)?
+                .or(b.to_expr(id_column, queries_results)?)),
+            ExecutableFilterTree::Not(a) => Ok(a.to_expr(id_column, queries_results)?.not()),
+            ExecutableFilterTree::FilterExpr(_) => {
+                let query_result = queries_results.pop().ok_or(exec_datafusion_err!(
+                    "not enough queries results in Inverted Index!"
+                ))?;
+                let value_is_number = matches!(
+                    id_column.data_type(),
+                    DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                        | DataType::UInt64
+                );
+
+                let mut values: Vec<ast::Expr> = query_result
+                    .into_iter()
+                    .map(|v| {
+                        ast::Expr::Value(
+                            if value_is_number {
+                                v.as_number_value().unwrap()
+                            } else {
+                                Value::HexStringLiteral(hex::encode(v))
+                            }
+                            .into(),
+                        )
+                    })
+                    .collect();
+
+                if values.len() == 0 {
+                    Ok(ast::Expr::Value(Value::Boolean(false).into()))
+                } else if values.len() == 1 {
+                    let result = values.pop().unwrap();
+                    Ok(ast::Expr::BinaryOp {
+                        op: BinaryOperator::Eq,
+                        left: Box::new(ast::Expr::Identifier(Ident::new(id_column.name()))),
+                        right: Box::new(result),
+                    })
+                } else {
+                    Ok(ast::Expr::InList {
+                        expr: Box::new(ast::Expr::Identifier(Ident::new(id_column.name()))),
+                        negated: false,
+                        list: values,
+                    })
+                }
             }
         }
     }
@@ -658,6 +453,7 @@ impl ExecutableFilterTree {
                                 Box::new(a),
                             ))
                         } else {
+                            // TODO: this branch should never be reached?
                             // Forward AND as is (no simplify)
                             ExecutableFilterTree::And(
                                 Box::new(ExecutableFilterTree::Not(a)),
@@ -720,232 +516,13 @@ impl ExecutableFilterTree {
             }
             ExecutableFilterTree::Not(a) => {
                 let a = a.simplify();
-                ExecutableFilterTree::Not(Box::new(a))
+                if let ExecutableFilterTree::Not(a) = a {
+                    *a // simplify double not
+                } else {
+                    ExecutableFilterTree::Not(Box::new(a))
+                }
             }
             leaf => leaf,
-        }
-    }
-}
-
-impl FilterTree {
-    fn is_unsupported(&self) -> bool {
-        matches!(self, Self::UnsupportedFilter(_))
-    }
-
-    fn is_kwsearch(&self) -> bool {
-        matches!(self, Self::KwSearch(_))
-    }
-
-    #[allow(unused)]
-    #[warn(unused)]
-    fn has_unsupported_child(&self) -> bool {
-        match self {
-            FilterTree::And(a, b) | FilterTree::Or(a, b) => {
-                a.has_unsupported_child() || b.has_unsupported_child()
-            }
-            FilterTree::Not(a) => a.has_unsupported_child(),
-            FilterTree::UnsupportedFilter(_) => true,
-            FilterTree::BooleanExpr { .. } => false,
-            FilterTree::KwSearch(_) => false,
-            FilterTree::Empty => false,
-        }
-    }
-
-    fn is_entirely_unsuported(&self) -> bool {
-        match self {
-            FilterTree::And(a, b) | FilterTree::Or(a, b) => {
-                a.is_entirely_unsuported() && b.is_entirely_unsuported()
-            }
-            FilterTree::Not(a) => a.is_entirely_unsuported(),
-            FilterTree::UnsupportedFilter(_) => true,
-            FilterTree::BooleanExpr { .. } => false,
-            FilterTree::KwSearch(_) => false,
-            FilterTree::Empty => false,
-        }
-    }
-
-    fn has_kwsearch_child(&self) -> bool {
-        match self {
-            FilterTree::And(a, b) | FilterTree::Or(a, b) => {
-                a.has_kwsearch_child() || b.has_kwsearch_child()
-            }
-            FilterTree::Not(a) => a.has_kwsearch_child(),
-            FilterTree::UnsupportedFilter(_) => false,
-            FilterTree::BooleanExpr { .. } => false,
-            FilterTree::KwSearch(_) => true,
-            FilterTree::Empty => false,
-        }
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        matches!(self, FilterTree::Empty)
-    }
-
-    pub fn simplify(self) -> Self {
-        // We want to eliminate as many NOT as possible, and move them UP whenever we can
-        // BUT we accept NOT as a leaf for some terms (it's just the KwSearch that we don't like actually)
-        // SO: NOT(kwsearch) as a leaf: not great, want removed
-        // NOT(boolean | unsupported) as leafs: okay, can be simplified
-
-        // AND:
-        // NOT(kwsearch) AND NOT(boolean) => NOT(kwsearch OR boolean) (single expr, preferred)
-        // NOT(kwsearch) AND boolean => NOT(kwsearch OR NOT(boolean)) (single expr, preferred - NOT(boolean) will be simplified - should we simplify it immediately?)
-
-        // NOT(kwsearch) AND unsupported => preferred form (separate unsupported)
-        // NOT(kwsearch) AND kwsearch => sadly we cannot do better
-
-        // kwsearch AND NOT(boolean) => preferred (single expr, convert?)
-        // kwsearch AND kwsearch => preferred
-        // kwsearch AND unsupported => preferred
-
-        // OR:
-        // NOT(kwsearch) OR NOT(boolean) => NOT(kwsearch AND boolean) (single expr, preferred)
-        // NOT(kwsearch) OR boolean => NOT(kwsearch AND NOT(boolean)) (single expr, preferred)
-        // NOT(kwsearch) OR unsupported => untouched
-        // NOT(kwsearch) OR kwsearch => untouched
-        // kwsearch OR NOT(boolean) => untouched - single expr
-        // kwsearch OR kwsearch => untouched
-
-        // Rule 0: simplify children first
-        // Rule 1: distribute NOT(kwsearch) AND ... and NOT(kwsearch) OR
-        // BASICALLY: only touch if we have a NOT(kwsearch) somewhere, both in OR and AND.
-        // Rule 2: do not touch NOT directly, will be done when converting later on
-
-        // How can we pull unsupported nodes?
-        // 1. NOT(unsupported) is equiv to unsupported here
-        // Trivially: we can at least pull unsupported nodes AND(AND(unsupp), supp), supp) <=> AND(AND(supp, supp), unsupp)
-        // Identical for OR
-        // Identical for NOT (but ignore it)
-
-        match self {
-            FilterTree::And(left, right) | FilterTree::Or(left, right) if left.is_empty() => {
-                right.simplify()
-            }
-            FilterTree::And(left, right) | FilterTree::Or(left, right) if right.is_empty() => {
-                left.simplify()
-            }
-            FilterTree::And(left, right) => {
-                let left = left.simplify();
-                let right = right.simplify();
-
-                match (left, right) {
-                    (a, b) if a.is_unsupported() || b.is_unsupported() => {
-                        // We cannot touch nodes with unsupported components
-                        FilterTree::And(Box::new(a), Box::new(b))
-                    }
-                    (FilterTree::Not(a), FilterTree::Not(b)) => {
-                        // Two boolean expressions, we lift NOT up
-                        FilterTree::Not(Box::new(FilterTree::Or(a, b)))
-                    }
-                    (FilterTree::Not(a), b) | (b, FilterTree::Not(a))
-                        if a.is_kwsearch() && !b.has_kwsearch_child() =>
-                    {
-                        // we want to eliminate Not(kwsearch), without introducing a new one down below - would be bad
-                        FilterTree::Not(Box::new(FilterTree::Or(
-                            a,                                      // Eliminated not (moved up)
-                            Box::new(FilterTree::Not(Box::new(b))), // introduced not (on a node that can take it)
-                        )))
-                    }
-                    (a, b) => FilterTree::And(Box::new(a), Box::new(b)),
-                }
-            }
-            FilterTree::Or(left, right) => {
-                let left = left.simplify();
-                let right = right.simplify();
-
-                match (left, right) {
-                    (a, b) if a.is_unsupported() || b.is_unsupported() => {
-                        // We cannot touch nodes with unsupported components
-                        FilterTree::Or(Box::new(a), Box::new(b))
-                    }
-                    (FilterTree::Not(a), FilterTree::Not(b)) => {
-                        // Two boolean expressions, we lift NOT up
-                        FilterTree::Not(Box::new(FilterTree::And(a, b)))
-                    }
-                    (FilterTree::Not(a), b) | (b, FilterTree::Not(a))
-                        if a.is_kwsearch() && !b.has_kwsearch_child() =>
-                    {
-                        // we want to eliminate Not(kwsearch), without introducing a new one down below - would be bad
-                        FilterTree::Not(Box::new(FilterTree::And(
-                            a,                                      // Eliminated not (moved up)
-                            Box::new(FilterTree::Not(Box::new(b))), // introduced not (on a node that can take it)
-                        )))
-                    }
-                    (a, b) => FilterTree::Or(Box::new(a), Box::new(b)),
-                }
-            }
-            other => other,
-        }
-    }
-
-    pub fn eliminate_unsupported_branches(self) -> FilterTree {
-        match self {
-            FilterTree::And(left, right) => {
-                let left = left.eliminate_unsupported_branches();
-                let right = right.eliminate_unsupported_branches();
-
-                if matches!(left, FilterTree::UnsupportedFilter(_)) {
-                    right
-                } else if matches!(right, FilterTree::UnsupportedFilter(_)) {
-                    left
-                } else {
-                    FilterTree::And(Box::new(left), Box::new(right))
-                }
-            }
-            FilterTree::Or(left, right) => {
-                let left = left.eliminate_unsupported_branches();
-                let right = right.eliminate_unsupported_branches();
-
-                if matches!(left, FilterTree::UnsupportedFilter(_)) {
-                    right
-                } else if matches!(right, FilterTree::UnsupportedFilter(_)) {
-                    left
-                } else {
-                    FilterTree::Or(Box::new(left), Box::new(right))
-                }
-            }
-            FilterTree::Not(inner) => {
-                let inner = inner.eliminate_unsupported_branches();
-                if matches!(inner, FilterTree::UnsupportedFilter(_)) {
-                    inner
-                } else {
-                    FilterTree::Not(Box::new(inner))
-                }
-            }
-            leaf @ (FilterTree::BooleanExpr { .. }
-            | FilterTree::KwSearch(_)
-            | FilterTree::UnsupportedFilter(_)
-            | FilterTree::Empty) => leaf,
-        }
-    }
-
-    pub fn to_executable(self) -> ExecutableFilterTree {
-        match self {
-            FilterTree::And(l, r) => {
-                ExecutableFilterTree::And(Box::new(l.to_executable()), Box::new(r.to_executable()))
-            }
-            FilterTree::Or(l, r) => {
-                ExecutableFilterTree::Or(Box::new(l.to_executable()), Box::new(r.to_executable()))
-            }
-            FilterTree::Not(inner) => match *inner {
-                FilterTree::BooleanExpr { if_false, .. } => {
-                    ExecutableFilterTree::FilterExpr(RawIndexQuery::Term(if_false))
-                }
-                FilterTree::UnsupportedFilter(expr) => {
-                    let new_expr = match *expr {
-                        Expr::Not(inner) | Expr::IsFalse(inner) | Expr::IsNotTrue(inner) => inner,
-                        other => Box::new(Expr::Not(Box::new(other))),
-                    };
-                    ExecutableFilterTree::UnsupportedFilter(new_expr)
-                }
-                other => ExecutableFilterTree::Not(Box::new(other.to_executable())),
-            },
-            FilterTree::BooleanExpr { if_true: s, .. } | FilterTree::KwSearch(s) => {
-                ExecutableFilterTree::FilterExpr(RawIndexQuery::Term(s))
-            }
-            FilterTree::UnsupportedFilter(expr) => ExecutableFilterTree::UnsupportedFilter(expr),
-            FilterTree::Empty => unreachable!("no empty node should remain in tree"),
         }
     }
 }
@@ -966,15 +543,6 @@ impl<const N: usize> EncryptedIndex for InvertedIndex<N> {
         Ok(IndexInsertStrategy::IndexSink(Arc::new(sink)))
     }
 
-    fn query(
-        self: Arc<Self>,
-        table_ref: &MySqlTableProvider,
-        _key_manager: Arc<LongTermKeyManager>,
-        filter: &[Expr],
-    ) -> datafusion::common::Result<Option<IndexQueryStrategy>> {
-        InvertedIndex::<N>::query(self, table_ref, filter)
-    }
-
     fn is_column_hidden(&self, _column: &ColumnName) -> bool {
         false
     }
@@ -983,23 +551,19 @@ impl<const N: usize> EncryptedIndex for InvertedIndex<N> {
         InvertedIndex::<N>::tracked_columns(self).clone()
     }
 
-    fn supports_expression(&self, filter: &Expr) -> bool {
-        self.supports_query(filter)
-    }
-
     async fn create_index_plan(
-        &self,
-        parent_table_ref: ResolvedTableReference,
+        self: Arc<Self>,
+        parent_table_ref: &ResolvedTableReference,
         session_state: &SessionState,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let result = CreateInvertedIndexPlan::<N>::new(
             session_state,
-            Arc::new(self.clone()),
+            self,
             session_state
                 .get_catalog()
                 .mysql_schema(&parent_table_ref.schema)
                 .unwrap(),
-            parent_table_ref,
+            parent_table_ref.clone(),
         )
         .await?;
 
@@ -1025,8 +589,31 @@ impl<const N: usize> EncryptedIndex for InvertedIndex<N> {
         Ok(IndexInsertStrategy::IndexSink(Arc::new(sink)))
     }
 
-    fn linked_table_names(&self) -> Vec<String> {
-        vec![self.inner.table_name().to_string()]
+    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn logical_support_options<'s, 'b>(&'s self) -> SupportOptions<'s, &'b Expr> {
+        SupportOptions {
+            supports_not: true,
+            supports_or: true,
+            is_supported: Box::new(|v, _| self.is_supported(v)),
+        }
+    }
+
+    fn logical_query(
+        self: Arc<Self>,
+        _table_reference: &ResolvedTableReference,
+        _indexable_column: Option<&RowIdColumn>,
+        _key_manager: &Arc<LongTermKeyManager>,
+        _filter: IndexableLogicalExpr,
+    ) -> datafusion::common::Result<IndexQueryStrategy> {
+        self.query(
+            _indexable_column.ok_or(plan_datafusion_err!(
+                "missing indexable column on table (required by inverted index query)"
+            ))?,
+            _filter,
+        )
     }
 }
 
@@ -1046,23 +633,27 @@ pub struct InvertedIndexConfig {
 impl IndexConfig for InvertedIndexConfig {
     fn into_index(
         self,
-        table_name: &str,
-        indexable_column: IndexableColumn,
+        table_name: &ResolvedTableReference,
+        indexable_column: Option<&RowIdColumn>,
     ) -> Arc<dyn EncryptedIndex> {
-        match indexable_column.size() {
-            IndexableColumnSize::B8 => self.into_sized_index::<1>(table_name),
-            IndexableColumnSize::B16 => self.into_sized_index::<2>(table_name),
-            IndexableColumnSize::B32 => self.into_sized_index::<4>(table_name),
-            IndexableColumnSize::B64 => self.into_sized_index::<8>(table_name),
-            IndexableColumnSize::B96 => self.into_sized_index::<12>(table_name),
-            IndexableColumnSize::B128 => self.into_sized_index::<16>(table_name),
+        match indexable_column
+            .expect("failed to parse inverted index: row_id_column is not defined")
+            .size()
+        {
+            RowIdColumnSize::Size4Bytes => self.into_sized_index::<4>(table_name),
+            RowIdColumnSize::Size8Bytes => self.into_sized_index::<8>(table_name),
+            RowIdColumnSize::Size12Bytes => self.into_sized_index::<12>(table_name),
+            RowIdColumnSize::Size16Bytes => self.into_sized_index::<16>(table_name),
         }
     }
 }
 
 impl InvertedIndexConfig {
-    fn into_sized_index<const N: usize>(self, table_name: &str) -> Arc<dyn EncryptedIndex> {
-        let inner = RawInvertedIndex::<N>::new(table_name.to_string(), self.index_name.clone());
+    fn into_sized_index<const N: usize>(
+        self,
+        table_name: &ResolvedTableReference,
+    ) -> Arc<dyn EncryptedIndex> {
+        let inner = RawInvertedIndex::<N>::new(table_name.clone(), self.index_name.clone());
         let ordered_tracked_columns: Vec<_> = self
             .watched_string_columns
             .iter()
@@ -1146,7 +737,7 @@ struct CreateInvertedIndexPlan<const IdSize: usize> {
     schema_provider: Arc<MySqlSchemaProvider>,
     index_config: Arc<InvertedIndex<IdSize>>,
     parent_table: ResolvedTableReference,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl<const IdSize: usize> CreateInvertedIndexPlan<IdSize> {
@@ -1156,34 +747,10 @@ impl<const IdSize: usize> CreateInvertedIndexPlan<IdSize> {
         schema_provider: Arc<MySqlSchemaProvider>,
         table: ResolvedTableReference,
     ) -> datafusion::common::Result<Self> {
-        let indexable_column = {
-            let table_provider = schema_provider.mysql_table(&table.table).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "CreateInvertedIndexPlan: Table not found {}",
-                    table.table
-                ))
-            })?;
-
-            table_provider.get_indexable_column()
-        };
-
-        let indexable_column = if let Some(indexable_column) = indexable_column {
-            indexable_column
-        } else {
-            let conn = session.config().get_conn();
-            let mut conn = conn
-                .try_lock()
-                .expect("could not lock connection to create index column");
-
-            schema_provider
-                .force_create_indexable_column(table.table.as_ref(), &mut conn)
-                .await?
-        };
-
-        // Create the plan to select whole table for index construction
         let table_provider = schema_provider
             .mysql_table(&table.table)
-            .expect("race condition: table vanished");
+            .ok_or_else(|| plan_datafusion_err!("table not found: {}", table))?;
+        let indexable_column = table_provider.try_get_row_id_column()?;
         let schema = table_provider.schema();
 
         let tracked_columns = index
@@ -1191,7 +758,7 @@ impl<const IdSize: usize> CreateInvertedIndexPlan<IdSize> {
             .iter()
             .filter_map(|col| schema.field_with_name(col).ok().cloned());
 
-        let fetched_columns: Vec<Field> = iter::once(indexable_column.clone())
+        let fetched_columns: Vec<Field> = iter::once(indexable_column.field())
             .chain(tracked_columns)
             .collect();
 
@@ -1222,8 +789,8 @@ impl<const IdSize: usize> CreateInvertedIndexPlan<IdSize> {
 
         // Create the plan to create the base index
         let base_plan = CreateDbInvertedIndexPlan::<IdSize>::new_from_data(
-            table.table.to_string(),
-            index.inner.index_name().to_string(),
+            table.clone(),
+            index.inner.index_name().clone(),
             Arc::new(project_plan),
         )?;
 
@@ -1256,7 +823,7 @@ impl<const IdSize: usize> ExecutionPlan for CreateInvertedIndexPlan<IdSize> {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1446,7 +1013,7 @@ impl<const N: usize> ProjectTransformIntoTerms<N> {
 
         for v in string_column {
             if let Some(v) = v {
-                for sub_value in self.parent_index.parse_string(v) {
+                for sub_value in self.parent_index.parse_like_string(v) {
                     builder.values().append_value(sub_value.as_slice());
                 }
                 builder.append(true);
@@ -1591,14 +1158,9 @@ impl<const N: usize> InvertedIndexInsertSink<N> {
         let terms_project_name = format!("_idx_{}_terms", index.inner.index_name());
 
         // Find ID column
-        let indexable_column = table.get_indexable_column().ok_or_else(|| {
-            DataFusionError::Plan("table must have an indexable column".to_string())
-        })?;
-        let indexable_column_select = Arc::new(physical_expr::expressions::Column::new(
-            indexable_column.name(),
-            input_schema.index_of(&indexable_column.name())?,
-        ));
-        let id_extractor = Arc::new(ToBinaryExpr::new(indexable_column_select));
+        let id_extractor = table
+            .try_get_row_id_column()?
+            .rowid_bin_physical(input_schema.as_ref())?;
 
         // Find terms columns
         let terms_extractor = Arc::new(ProjectTransformIntoTerms::new_for_found_columns(
@@ -1714,23 +1276,16 @@ impl<const N: usize> InvertedIndexUpdateSink<N> {
         table: &MySqlTableProvider,
         input_schema: &SchemaRef,
     ) -> datafusion::common::Result<Arc<dyn PhysicalExpr>> {
-        let indexable_column = table.get_indexable_column().ok_or_else(|| {
-            DataFusionError::Plan("table must have an indexable column".to_string())
-        })?;
+        let row_id = table
+            .get_row_id_column()
+            .ok_or_else(|| plan_datafusion_err!("table must have an indexable column"))?;
 
-        let indexable_column_name = if table.get_indexable_column_type().is_generated() {
-            format!("{CURRENT_VALUE_PREFIX}{}", indexable_column.name())
+        if row_id.is_hidden() {
+            row_id.rowid_bin_physical_prefixed(CURRENT_VALUE_PREFIX, input_schema.as_ref())
         } else {
             // The column is the primary key and should therefore be present as a filter
-            format!("{FILTER_PREFIX}{}", indexable_column.name())
-        };
-
-        let indexable_column_select = Arc::new(physical_expr::expressions::Column::new(
-            &indexable_column_name,
-            input_schema.index_of(&indexable_column_name)?,
-        ));
-
-        Ok(Arc::new(ToBinaryExpr::new(indexable_column_select)) as _)
+            row_id.rowid_bin_physical_prefixed(FILTER_PREFIX, input_schema.as_ref())
+        }
     }
 
     pub fn new(

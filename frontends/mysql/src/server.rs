@@ -10,7 +10,7 @@ use std::os::linux::net::TcpStreamExt;
 use std::thread;
 
 impl<T: ProxyImplementation + 'static> Frontend for MySqlFrontend<T> {
-    async fn start_listening(self) -> ! {
+    fn start_listening(self) -> ! {
         let port: u16 = self.config.port.unwrap_or(13306);
         let host = self.config.host.clone().unwrap_or(String::from("0.0.0.0"));
 

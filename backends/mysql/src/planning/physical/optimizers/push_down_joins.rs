@@ -79,6 +79,8 @@ impl PushDownJoins {
             equijoin_where.into_iter(),
             &join.projection,
             join.schema(),
+            join.partition_statistics(None)
+                .expect("HashJoinExec should always return statistics if partition is None"),
         )?;
         let new_plan: Arc<dyn ExecutionPlan> = Arc::new(new_plan);
 

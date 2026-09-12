@@ -1,5 +1,4 @@
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use common::dml::{DML_SCHEMA, DmlResult};
 use datafusion::common::stats::Precision;
 use datafusion::common::{DataFusionError, Statistics};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -14,39 +13,38 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct NoOpDdlPlan {
-    props: PlanProperties,
+    props: Arc<PlanProperties>,
 }
 
 impl NoOpDdlPlan {
     pub fn new() -> Arc<Self> {
-        let schema_ref = SchemaRef::new(Schema::empty());
         Arc::new(NoOpDdlPlan {
-            props: PlanProperties::new(
-                EquivalenceProperties::new(schema_ref),
+            props: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(&DML_SCHEMA)),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 }
 
 impl DisplayAs for NoOpDdlPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "no_op")
+        write!(f, "NoOpDdlPlan")
     }
 }
 
 impl ExecutionPlan for NoOpDdlPlan {
     fn name(&self) -> &str {
-        "no_op"
+        "NoOpDdlPlan"
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.props
     }
 
@@ -66,9 +64,7 @@ impl ExecutionPlan for NoOpDdlPlan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
-        let schema = self.schema().clone();
-        let result =
-            async move { Result::<_, DataFusionError>::Ok(RecordBatch::new_empty(schema)) };
+        let result = async move { Result::<_, DataFusionError>::Ok(DmlResult::empty().into()) };
 
         let result = once(result);
         let schema = self.schema();
@@ -77,7 +73,14 @@ impl ExecutionPlan for NoOpDdlPlan {
         Ok(Box::pin(result))
     }
 
-    fn statistics(&self) -> datafusion::common::Result<Statistics> {
-        Ok(Statistics::default().with_num_rows(Precision::Exact(0)))
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion::common::Result<Statistics> {
+        if partition.is_some() {
+            Ok(Statistics::new_unknown(self.schema().as_ref()))
+        } else {
+            Ok(Statistics::default().with_num_rows(Precision::Exact(0)))
+        }
     }
 }

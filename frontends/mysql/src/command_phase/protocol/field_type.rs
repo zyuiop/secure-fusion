@@ -40,7 +40,7 @@ impl<'a> From<DataTypeOps<'a>> for ColumnType {
             DataType::Decimal256(_, _) => ColumnType::MYSQL_TYPE_DECIMAL,
             DataType::List(_) => todo!(),
             DataType::ListView(_) => todo!(),
-            DataType::FixedSizeList(_, _) => todo!(),
+            DataType::FixedSizeList(_, _) => ColumnType::MYSQL_TYPE_VECTOR,
             DataType::LargeList(_) => todo!(),
             DataType::LargeListView(_) => todo!(),
             DataType::Struct(_) => todo!(),

@@ -27,17 +27,17 @@ mod auto_escape_vec {
     #[inline]
     const fn replace_escaped(source: u8) -> u8 {
         match source as char {
-            ('0') => '\0' as u8,
-            ('\'') => '\'' as u8,
-            ('"') => '"' as u8,
-            ('b') => 8u8, /* Backspace \b */
-            ('n') => '\n' as u8,
-            ('r') => '\r' as u8,
-            ('t') => '\t' as u8,
-            ('Z') => 26u8,
-            ('\\') => '\\' as u8,
-            ('%') => '%' as u8,
-            ('_') => '_' as u8,
+            '0' => '\0' as u8,
+            '\'' => '\'' as u8,
+            '"' => '"' as u8,
+            'b' => 8u8, /* Backspace \b */
+            'n' => '\n' as u8,
+            'r' => '\r' as u8,
+            't' => '\t' as u8,
+            'Z' => 26u8,
+            '\\' => '\\' as u8,
+            '%' => '%' as u8,
+            '_' => '_' as u8,
             other => other as u8,
         }
     }

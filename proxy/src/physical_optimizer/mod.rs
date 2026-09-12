@@ -5,8 +5,6 @@ use datafusion::config::ConfigOptions;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
-use datafusion::physical_optimizer::coalesce_async_exec_input::CoalesceAsyncExecInput;
-use datafusion::physical_optimizer::coalesce_batches::CoalesceBatches;
 use datafusion::physical_optimizer::combine_partial_final_agg::CombinePartialFinalAggregate;
 use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
@@ -16,6 +14,7 @@ use datafusion::physical_optimizer::limited_distinct_aggregation::LimitedDistinc
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_optimizer::output_requirements::OutputRequirements;
 use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
+use datafusion::physical_optimizer::pushdown_sort::PushdownSort;
 use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
 use datafusion::physical_optimizer::topk_aggregation::TopKAggregation;
 use datafusion::physical_optimizer::update_aggr_exprs::OptimizeAggregateOrder;
@@ -85,10 +84,6 @@ pub fn default_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Sync + S
         Arc::new(OptimizeAggregateOrder::new()),
         // TODO: `try_embed_to_hash_join` in the ProjectionPushdown rule would be block by the CoalesceBatches, so add it before CoalesceBatches. Maybe optimize it in the future.
         Arc::new(ProjectionPushdown::new()),
-        // The CoalesceBatches rule will not influence the distribution and ordering of the
-        // whole plan tree. Therefore, to avoid influencing other rules, it should run last.
-        Arc::new(CoalesceBatches::new()),
-        Arc::new(CoalesceAsyncExecInput::new()),
         // Remove the ancillary output requirement operator since we are done with the planning
         // phase.
         Arc::new(OutputRequirements::new_remove_mode()),
@@ -112,6 +107,8 @@ pub fn default_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Sync + S
         // are not present, the load of executors such as join or union will be
         // reduced by narrowing their input tables.
         Arc::new(ProjectionPushdown::new()),
+        // PushdownSort: Detect sorts that can be pushed down to data sources.
+        Arc::new(PushdownSort::new()),
         // Arc::new(EnsureCooperative::new()),
         // This FilterPushdown handles dynamic filters that may have references to the source ExecutionPlan.
         // Therefore it should be run at the end of the optimization process since any changes to the plan may break the dynamic filter's references.

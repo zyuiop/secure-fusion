@@ -1,33 +1,41 @@
 pub mod blind_index;
-mod indices;
+pub mod indices;
 pub mod kw_search_func;
 pub mod store;
 
 use crate::backend_config::BackendConfig;
 use crate::expr_util::identifiers_in_expr;
+use crate::filtering::indexable_filter::SupportOptions;
+use crate::filtering::logical::IndexableLogicalExpr;
+use crate::filtering::physical::IndexablePhysicalExpr;
 use crate::metadata::blind_index::BlindIndexConfig;
-use crate::metadata::indices::InvertedIndexConfig;
-use crate::planning::physical::plans::mysql_scan_plan::DynamicFilter;
-use crate::providers::table_provider::{IndexableColumn, IndexableColumnSize, MySqlTableProvider};
+use crate::metadata::indices::inverted_index::inverted_index::InvertedIndexConfig;
+use crate::metadata::indices::range_queries::{ObfuscationStrategy, RangeIndex, ValueDistribution};
+use crate::providers::table_provider::MySqlTableProvider;
 use crate::sinks::sink::RecordBatchSink;
 use async_trait::async_trait;
 use common::conversions::column_def_ext::ColumnDefExt;
 use common::conversions::datatypes::ArrowDatatypeConverter;
 use crypto::LongTermKeyManager;
+use crypto::row_id::RowIdColumn;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::catalog::TableProvider;
 use datafusion::common::{exec_err, plan_err};
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
+use datafusion::execution::{SessionState, TaskContext};
 use datafusion::logical_expr::Expr;
-use datafusion::logical_expr::sqlparser::ast::{ColumnDef, TableConstraint};
+use datafusion::logical_expr::sqlparser::ast::{
+    CheckConstraint, ColumnDef, ForeignKeyConstraint, FullTextOrSpatialConstraint, IndexConstraint,
+    TableConstraint, UniqueConstraint,
+};
 use datafusion::physical_expr::projection::ProjectionExpr;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::sql::ResolvedTableReference;
 use datafusion::sql::sqlparser::ast;
 use datafusion::sql::sqlparser::ast::CreateTable;
-use log::trace;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -48,7 +56,10 @@ impl EncryptedSchemaMeta {
 pub struct SerializableEncryptedTableMeta {
     pub encrypted_columns: FxHashMap<ColumnName, EncryptedColumnMeta>,
     pub indices: Vec<EncryptedIndexConfigurationVariant>,
-    pub indexable_column: IndexableColumn,
+    pub row_id_column: Option<RowIdColumn>,
+
+    #[serde(default)]
+    pub row_binding_aad: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -57,12 +68,17 @@ pub struct SerializableEncryptedSchemaMeta {
 }
 
 impl SerializableEncryptedSchemaMeta {
-    pub fn deserialize(self) -> EncryptedSchemaMeta {
+    pub fn deserialize(self, catalog_name: Arc<str>, schema_name: Arc<str>) -> EncryptedSchemaMeta {
         let tables = self
             .encrypted_tables
             .into_iter()
             .map(|(k, v)| {
-                let v = EncryptedTableMeta::deserialize(&k, v);
+                let table_ref = ResolvedTableReference {
+                    schema: schema_name.clone(),
+                    table: k.clone().into(),
+                    catalog: catalog_name.clone(),
+                };
+                let v = EncryptedTableMeta::deserialize(table_ref, v);
                 (k, v)
             })
             .collect();
@@ -76,14 +92,17 @@ impl SerializableEncryptedSchemaMeta {
 impl EncryptedIndexConfigurationVariant {
     pub fn build(
         self,
-        table_name: &str,
-        indexable_column: IndexableColumn,
+        table_name: &ResolvedTableReference,
+        indexable_column: Option<&RowIdColumn>,
     ) -> Arc<dyn EncryptedIndex> {
         match self {
             EncryptedIndexConfigurationVariant::BlindIndex(bi) => {
                 bi.into_index(table_name, indexable_column)
             }
             EncryptedIndexConfigurationVariant::InvertedIndex(ii) => {
+                ii.into_index(table_name, indexable_column)
+            }
+            EncryptedIndexConfigurationVariant::RangeIndex(ii) => {
                 ii.into_index(table_name, indexable_column)
             }
         }
@@ -93,21 +112,31 @@ impl EncryptedIndexConfigurationVariant {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EncryptedIndexConfigurationVariant {
     BlindIndex(BlindIndexConfig),
+    RangeIndex(RangeIndex),
     InvertedIndex(InvertedIndexConfig),
 }
 
 trait IndexConfig {
     fn into_index(
         self,
-        table_name: &str,
-        indexable_column: IndexableColumn,
+        _table_name: &ResolvedTableReference,
+        _indexable_column: Option<&RowIdColumn>,
     ) -> Arc<dyn EncryptedIndex>;
 }
 
 const BLIND_INDEX_PFX: &str = "blind_bits_";
+const RANGE_INDEX_PFX: &str = "range_";
 const INVERTED_INDEX_NAME: &str = "inverted_index";
 
 impl EncryptedIndexConfigurationVariant {
+    pub fn requires_rowid(&self) -> bool {
+        match self {
+            EncryptedIndexConfigurationVariant::BlindIndex(_) => false,
+            EncryptedIndexConfigurationVariant::RangeIndex(_) => false,
+            EncryptedIndexConfigurationVariant::InvertedIndex(_) => true,
+        }
+    }
+
     pub fn parse_from_sql(
         name: String,
         columns: Vec<ColumnName>,
@@ -133,6 +162,22 @@ impl EncryptedIndexConfigurationVariant {
                     column,
                 },
             ))
+        } else if let Some(rest) = sql.strip_prefix(RANGE_INDEX_PFX) {
+            // Blind index
+            if columns.len() != 1 {
+                plan_err!("Cannot create blind index: exactly one column is required")?
+            }
+
+            let column = columns[0].clone();
+            let schema = table.schema();
+            let column = schema.field_with_name(&column)?;
+            let data_type = column.data_type();
+
+            let vd = ValueDistribution::parse(data_type, rest)?;
+
+            Ok(EncryptedIndexConfigurationVariant::RangeIndex(
+                RangeIndex::new(&name, column.name(), vd, ObfuscationStrategy::NoObfuscation),
+            ))
         } else if sql == INVERTED_INDEX_NAME {
             Ok(EncryptedIndexConfigurationVariant::InvertedIndex(
                 InvertedIndexConfig::initialize_for_columns(name, table, columns)?,
@@ -144,20 +189,26 @@ impl EncryptedIndexConfigurationVariant {
 }
 
 impl EncryptedTableMeta {
-    fn deserialize(table_name: &str, value: SerializableEncryptedTableMeta) -> Self {
+    fn deserialize(
+        table_name: ResolvedTableReference,
+        value: SerializableEncryptedTableMeta,
+    ) -> Self {
         let SerializableEncryptedTableMeta {
             encrypted_columns,
             indices,
-            indexable_column,
+            row_id_column,
+            row_binding_aad,
         } = value;
         let indices = indices
             .into_iter()
-            .map(|index| index.build(table_name, indexable_column))
+            .map(|index| index.build(&table_name, row_id_column.as_ref()))
             .collect();
+
         Self {
             encrypted_columns,
-            indexable_column,
+            row_id_column,
             indices,
+            row_binding_aad,
         }
     }
 }
@@ -166,21 +217,26 @@ impl From<&'_ EncryptedTableMeta> for SerializableEncryptedTableMeta {
     fn from(value: &'_ EncryptedTableMeta) -> Self {
         Self {
             encrypted_columns: value.encrypted_columns.clone(),
-            indexable_column: value.indexable_column,
+            row_id_column: value.row_id_column.clone(),
             indices: value
                 .indices
                 .iter()
                 .map(|index| index.to_config())
                 .collect(),
+            row_binding_aad: value.row_binding_aad,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct EncryptedTableMeta {
-    encrypted_columns: FxHashMap<ColumnName, EncryptedColumnMeta>,
-    indices: Vec<Arc<dyn EncryptedIndex>>,
-    indexable_column: IndexableColumn,
+    pub(crate) encrypted_columns: FxHashMap<ColumnName, EncryptedColumnMeta>,
+    pub(crate) indices: Vec<Arc<dyn EncryptedIndex>>,
+    pub(crate) row_id_column: Option<RowIdColumn>,
+
+    /// If set, the associated data of each ciphertext will contain the row primary key.
+    /// Will be ignored for non-deterministic primary keys.
+    pub(crate) row_binding_aad: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -192,55 +248,18 @@ pub struct PrimaryKeyColumnDef {
 
 pub type PrimaryKey = Vec<PrimaryKeyColumnDef>;
 
-pub fn compute_expected_indexable_column_type(primary_key: &PrimaryKey) -> IndexableColumn {
-    const RANDOM_GENERATED: IndexableColumn =
-        IndexableColumn::RandomGenerated(IndexableColumnSize::B96);
-
-    if primary_key.len() == 1 {
-        let PrimaryKeyColumnDef {
-            has_default,
-            column_type,
-            ..
-        } = &primary_key[0];
-        if *has_default {
-            RANDOM_GENERATED
-        } else {
-            match column_type {
-                DataType::Int8 | DataType::UInt8 => {
-                    IndexableColumn::UserProvided(IndexableColumnSize::B8)
-                }
-                DataType::Int16 | DataType::UInt16 => {
-                    IndexableColumn::UserProvided(IndexableColumnSize::B16)
-                }
-                DataType::Int32 | DataType::UInt32 => {
-                    IndexableColumn::UserProvided(IndexableColumnSize::B32)
-                }
-                DataType::Int64 | DataType::UInt64 => {
-                    IndexableColumn::UserProvided(IndexableColumnSize::B64)
-                }
-                _ => RANDOM_GENERATED,
-            }
-        }
-    } else {
-        RANDOM_GENERATED
-    }
+pub fn supports_aad_binding(primary_key: &PrimaryKey) -> bool {
+    !primary_key.is_empty() && primary_key.iter().all(|col| !col.has_default)
 }
 
 impl EncryptedTableMeta {
     pub fn new() -> Self {
         Self {
+            indices: vec![],
             encrypted_columns: FxHashMap::default(),
-            indices: Vec::new(),
-            indexable_column: IndexableColumn::RandomGenerated(IndexableColumnSize::B96), // Default placeholder value
+            row_id_column: None,
+            row_binding_aad: false,
         }
-    }
-
-    pub fn indexable_column(&self) -> IndexableColumn {
-        self.indexable_column
-    }
-
-    pub fn set_indexable_column(&mut self, value: IndexableColumn) {
-        self.indexable_column = value
     }
 
     pub fn remove_column(&mut self, column: &ColumnName) {
@@ -253,11 +272,22 @@ impl EncryptedTableMeta {
         statement: &mut CreateTable,
         primary_key: &[ColumnName],
         config: &BackendConfig,
-    ) -> Result<Option<EncryptedTableMeta>, DataFusionError> {
-        // TODO: ensure primary key has no encrypted col
-        trace!("Detected primary key: {primary_key:?}");
-
+    ) -> Result<EncryptedTableMeta, DataFusionError> {
         let mut meta = Self::new();
+
+        // Try to build the row-id column
+        let projected_primary_key: Vec<_> = primary_key
+            .iter()
+            .filter_map(|col_name| {
+                statement
+                    .columns
+                    .iter()
+                    .find(|col| &col.name.value == col_name)
+            })
+            .collect();
+
+        meta.row_id_column = RowIdColumn::get_natural_if_any(&projected_primary_key);
+
         for column in statement.columns.iter_mut() {
             let Some(metadata) = EncryptedColumnMeta::try_from_column(column, primary_key, config)?
             else {
@@ -269,23 +299,32 @@ impl EncryptedTableMeta {
 
         // TODO: handle indexes here (will also need to modify the CreateTable accordingly!)
         if meta.has_encrypted_column() {
+            meta.row_binding_aad = config.row_binding_aad;
+
             let dropped_constraints = statement
                 .constraints
                 .extract_if(.., |constraint| {
                     match constraint {
                         TableConstraint::PrimaryKey { .. } => false, // Always fwd primary keys
-                        TableConstraint::Unique { columns, .. }
-                        | TableConstraint::Index { columns, .. }
-                        | TableConstraint::FulltextOrSpatial { columns, .. } => columns
+                        TableConstraint::Unique(UniqueConstraint { columns, .. })
+                        | TableConstraint::Index(IndexConstraint { columns, .. })
+                        | TableConstraint::FulltextOrSpatial(FullTextOrSpatialConstraint {
+                            columns,
+                            ..
+                        }) => columns
                             .iter()
                             .flat_map(|column| identifiers_in_expr(&column.column.expr))
                             .any(|column| meta.encrypted_columns.contains_key(&column)),
-                        TableConstraint::Check { expr, .. } => identifiers_in_expr(&expr)
-                            .iter()
-                            .any(|column| meta.encrypted_columns.contains_key(column)),
-                        TableConstraint::ForeignKey { columns, .. } => columns
-                            .iter()
-                            .any(|column| meta.encrypted_columns.contains_key(&column.value)),
+                        TableConstraint::Check(CheckConstraint { expr, .. }) => {
+                            identifiers_in_expr(&expr)
+                                .iter()
+                                .any(|column| meta.encrypted_columns.contains_key(column))
+                        }
+                        TableConstraint::ForeignKey(ForeignKeyConstraint { columns, .. }) => {
+                            columns
+                                .iter()
+                                .any(|column| meta.encrypted_columns.contains_key(&column.value))
+                        }
                     }
                 })
                 .collect::<Vec<_>>();
@@ -295,14 +334,10 @@ impl EncryptedTableMeta {
             }
         }
 
-        Ok(if meta.encrypted_columns.is_empty() {
-            None
-        } else {
-            Some(meta)
-        })
+        Ok(meta)
     }
 
-    pub fn column(&self, column_name: &ColumnName) -> Option<&EncryptedColumnMeta> {
+    pub fn column(&self, column_name: &str) -> Option<&EncryptedColumnMeta> {
         self.encrypted_columns.get(column_name)
     }
 
@@ -319,6 +354,13 @@ impl EncryptedTableMeta {
     }
 
     pub fn is_column_hidden(&self, column_name: &ColumnName) -> bool {
+        if let Some(row_id) = self.row_id_column.as_ref()
+            && column_name == row_id.name()
+            && row_id.is_hidden()
+        {
+            return true;
+        }
+
         self.indices()
             .iter()
             .any(|index| index.is_column_hidden(column_name))
@@ -326,6 +368,10 @@ impl EncryptedTableMeta {
 
     pub fn has_encrypted_column(&self) -> bool {
         !self.encrypted_columns.is_empty()
+    }
+
+    pub fn is_column_encrypted(&self, column_name: &str) -> bool {
+        self.encrypted_columns.contains_key(column_name)
     }
 }
 
@@ -404,7 +450,7 @@ impl EncryptedColumnMeta {
         column.data_type = ast::DataType::MediumBlob; // TODO: adopt size to source type!
         column.clear_encryption_flag();
 
-        Ok(Some((meta)))
+        Ok(Some(meta))
     }
 }
 
@@ -414,17 +460,60 @@ impl EncryptedColumnMeta {
     }
 }
 
+/// TODO: this interface does too many different things and should be split in three.
+///
+/// - The simplest case (blind-index) is not an _index_ but more a piece of logic that can rewrite
+///   a query to reduce the volume of data retrieved from the server.
+///   We want to avoid premature abstractions here. For now, an index in this case is a dedicated
+///   column that enables filtering. So we can rely on that to make a generic structure.
+///   Naming idea: SelectionColumn, MatchingColumn, PredicateColumn
+/// - The second case is traditional selection indices. We can have a look at datafusion-contrib's
+///   implementation for inspiration here. Ideally, we want them to be implemented in a kind of
+///   JOIN, with a forwarding implementation that forwards to the MySQL query operator.
+/// - The last case is for sort indices only.
+///
+/// The key point is that all the indices require some operations when rows are inserted or updated.
+/// The first index is quite simple, and should once again be handled differently.
 #[async_trait]
-pub(crate) trait EncryptedIndex: Send + Sync + Debug {
-    /// Returns a list of all tables that are related to this tables, for example index tables.
-    fn linked_table_names(&self) -> Vec<String>;
+pub(crate) trait EncryptedIndex: Send + Sync + Debug + Any {
+    #[allow(unused)]
+    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 
     /// Returns a set of columns this index tracks. The index must be notified (via insert, update,
     /// delete functions) when these columns change.
     fn tracked_columns(&self) -> FxHashSet<ColumnName>;
 
-    // Is this expression supported by this index? if so, it will be included in the call to query.
-    fn supports_expression(&self, filter: &Expr) -> bool;
+    fn logical_support_options<'s, 'b>(&'s self) -> SupportOptions<'s, &'b Expr>;
+
+    /// Queries the index with a filter.
+    ///
+    /// The filter passed to this function is entirely supported, so this function MUST return a
+    /// result.
+    fn logical_query(
+        self: Arc<Self>,
+        _table_reference: &ResolvedTableReference,
+        _indexable_column: Option<&RowIdColumn>,
+        _key_manager: &Arc<LongTermKeyManager>,
+        _filter: IndexableLogicalExpr,
+    ) -> datafusion::common::Result<IndexQueryStrategy> {
+        unimplemented!("this index cannot be queried")
+    }
+
+    fn physical_support_options<'s, 'b>(
+        &'s self,
+    ) -> Option<SupportOptions<'s, &'b dyn PhysicalExpr>> {
+        None
+    }
+
+    fn physical_query(
+        self: Arc<Self>,
+        _table_reference: &ResolvedTableReference,
+        _indexable_column: Option<&RowIdColumn>,
+        _key_manager: &Arc<LongTermKeyManager>,
+        _filter: IndexablePhysicalExpr,
+    ) -> datafusion::common::Result<IndexQueryStrategy> {
+        unimplemented!("this index cannot be queried")
+    }
 
     /// Returns true if this index has columns outside of the table to which it relates
     fn requires_external_storage(&self) -> bool;
@@ -436,8 +525,8 @@ pub(crate) trait EncryptedIndex: Send + Sync + Debug {
     }
 
     async fn create_index_plan(
-        &self,
-        parent_table_ref: ResolvedTableReference,
+        self: Arc<Self>,
+        parent_table_ref: &ResolvedTableReference,
         session_state: &SessionState,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>>;
 
@@ -458,20 +547,6 @@ pub(crate) trait EncryptedIndex: Send + Sync + Debug {
     ) -> datafusion::common::Result<IndexInsertStrategy> {
         self.insert(table_ref, key_manager, schema)
     }
-
-    // TODO: delete
-
-    /// Queries the index
-    ///
-    /// ## Params
-    ///
-    /// filters: a slice of all filters in the initial expression that are supported
-    fn query(
-        self: Arc<Self>,
-        table_ref: &MySqlTableProvider,
-        key_manager: Arc<LongTermKeyManager>,
-        filters: &[Expr],
-    ) -> datafusion::common::Result<Option<IndexQueryStrategy>>;
 
     fn is_column_hidden(&self, _column: &ColumnName) -> bool {
         false
@@ -526,11 +601,16 @@ pub fn validate_index_sink(sink: &dyn IndexSink) {
     }
 }
 
+#[async_trait]
+pub trait DynamicFilter: Send + Sync + Debug {
+    async fn execute_filter(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> datafusion::error::Result<ast::Expr>;
+}
+
 #[derive(Debug)]
 pub enum IndexQueryStrategy {
-    AddFilterExpression(Expr),
-
-    /// Returns an expression that will be added to the filter, and an expression that will be
-    /// executed as part of the query execution, but before the query is sent to the server
-    AddDynamicFilterExpression(Expr, Arc<dyn DynamicFilter>),
+    Fixed(ast::Expr),
+    Dynamic(Arc<dyn DynamicFilter>),
 }

@@ -4,7 +4,6 @@ use crate::planning::physical::plans::drop_table_plan::DropTablePlan;
 use crate::planning::physical::plans::transaction_control_plan::TransactionControl;
 use crate::providers::catalog_provider::MySqlCatalogProvider;
 use async_trait::async_trait;
-use crypto::planning::decrypt_planner::replace_decryptions_in_plan;
 use datafusion::common::exec_err;
 use datafusion::execution::SessionState;
 use datafusion::execution::context::QueryPlanner;
@@ -47,11 +46,13 @@ impl QueryPlanner for MySqlPhysicalPlanner {
             .do_create_physical_plan(logical_plan, session_state)
             .await?;
 
-        replace_decryptions_in_plan(base_plan, &session_state)
+        // replace_decryptions_in_plan(base_plan, &session_state)
+        Ok(base_plan)
     }
 }
 
 impl MySqlPhysicalPlanner {
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn do_create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,

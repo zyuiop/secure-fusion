@@ -93,7 +93,7 @@ impl StoreToDisk {
         let open_options = open_options.read(true).write(false);
 
         let Some(f) = open_options
-            .open(format!("{}/meta_{schema}.toml", self.path))
+            .open(format!("{}/meta_{schema}.v2.toml", self.path))
             .ok()
         else {
             return Ok(None);
@@ -107,7 +107,7 @@ impl StoreToDisk {
     }
 
     fn write_raw(&self, schema: &str, contents: &str) -> MySqlResult<()> {
-        let mut f = File::create(format!("{}/meta_{schema}.toml", self.path)).unwrap();
+        let mut f = File::create(format!("{}/meta_{schema}.v2.toml", self.path)).unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         Ok(())
     }

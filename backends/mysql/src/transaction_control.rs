@@ -70,6 +70,18 @@ impl TransactionControl {
         }
     }
 
+    /// Rollback the current operation if autocommit is true and no transaction is in progress
+    pub async fn weak_rollback(&self, conn: &(dyn ConnGetter + Send + Sync)) {
+        let mut guard = self.0.try_write().unwrap();
+
+        if guard.autocommit {
+            if let Some(TransactionStatus::Weak(_)) = guard.current_transaction {
+                conn.rollback().await.unwrap();
+                guard.current_transaction = None;
+            }
+        }
+    }
+
     /// Open a transaction if autocommit is true and no transaction is in progress
     pub async fn weak_start_transaction(&self, conn: &(dyn ConnGetter + Send + Sync)) {
         let mut guard = self.0.try_write().unwrap();

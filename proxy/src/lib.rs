@@ -20,10 +20,10 @@ pub mod session;
 #[cfg(feature = "df-trace")]
 mod physical_tracer;
 
+use crate::analyzer::add_decryption_rule::AddDecryptionRule;
 use crate::session::DataFusionSession;
 use ::crypto::LongTermKeyManager;
 use common::{Backend, LogicalPrePlanner};
-use crypto::planning::pushdown_decrypt_filters::PushDownDecryptionFilterRule;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionConfig;
 use std::sync::Arc;
@@ -32,14 +32,24 @@ pub struct DataFusionProxy<B: Backend> {
     backend: Arc<B>,
     long_term_key_manager: Arc<LongTermKeyManager>,
     logical_planner: Arc<dyn LogicalPrePlanner + Send + Sync>,
+
+    #[cfg(feature = "tracing")]
+    tracing_enabled: bool,
 }
 
 impl<B: Backend + 'static> DataFusionProxy<B> {
-    pub fn new(backend: B, long_term_key_manager: Arc<LongTermKeyManager>) -> Self {
+    pub fn new(
+        backend: B,
+        long_term_key_manager: Arc<LongTermKeyManager>,
+
+        #[cfg(feature = "tracing")] tracing_enabled: bool,
+    ) -> Self {
         Self {
             logical_planner: backend.get_logical_planner(),
             backend: Arc::new(backend),
             long_term_key_manager,
+            #[cfg(feature = "tracing")]
+            tracing_enabled,
         }
     }
 
@@ -95,8 +105,10 @@ impl<B: Backend + 'static> DataFusionProxy<B> {
             .with_default_features()
             .with_runtime_env(Arc::new(RuntimeEnv::default()));
 
-        let builder = analyzer::register_rules(builder)
-            .with_optimizer_rule(Arc::new(PushDownDecryptionFilterRule));
+        let builder = builder.with_analyzer_rule(Arc::new(AddDecryptionRule(
+            self.long_term_key_manager.clone(),
+        )));
+
         let mut builder = physical_optimizer::register_rules(builder);
 
         self.backend
@@ -106,9 +118,38 @@ impl<B: Backend + 'static> DataFusionProxy<B> {
         self.backend
             .add_physical_optimizer_rules(builder.physical_optimizers().get_or_insert_default());
 
+        #[cfg(feature = "tracing")]
+        if self.tracing_enabled {
+            let exec_options = datafusion_tracing::InstrumentationOptions::builder()
+                .record_metrics(true)
+                .preview_limit(0)
+                .build();
+
+            builder = builder.with_physical_optimizer_rule(
+                datafusion_tracing::instrument_with_info_spans!(
+                    options: exec_options,
+                ),
+            );
+        }
+
+        let state = builder.build();
+
+        #[cfg(feature = "tracing")]
+        let state = if self.tracing_enabled {
+            let rule_options =
+                datafusion_tracing::RuleInstrumentationOptions::full().with_plan_diff();
+
+            datafusion_tracing::instrument_rules_with_info_spans!(
+                options: rule_options,
+                state: state
+            )
+        } else {
+            state
+        };
+
         // let ctx = SessionContext::new_with_state(builder.build());
         DataFusionSession::new(
-            self.backend.finish_init_session(builder.build()),
+            self.backend.finish_init_session(state),
             self.logical_planner.clone(),
         )
     }

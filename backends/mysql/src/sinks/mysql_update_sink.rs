@@ -4,11 +4,11 @@ use datafusion::arrow::datatypes::FieldRef;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::WriteOp;
-use datafusion::sql::TableReference;
+use datafusion::sql::ResolvedTableReference;
 
 impl MySqlDmlSink {
     fn build_query_string_and_projection(
-        target_table: TableReference,
+        target_table: ResolvedTableReference,
         filters: Vec<&FieldRef>,
         updates: Vec<&FieldRef>,
         source_schema: &SchemaRef,
@@ -28,7 +28,10 @@ impl MySqlDmlSink {
             .collect::<Vec<_>>()
             .join(" AND ");
 
-        let query = format!(r#"UPDATE {target_table} SET {update} WHERE {filter}"#,);
+        let query = format!(
+            r#"UPDATE {}.{} SET {update} WHERE {filter}"#,
+            target_table.schema, target_table.table
+        );
 
         let projection = updates
             .iter()
@@ -40,7 +43,7 @@ impl MySqlDmlSink {
     }
 
     pub(crate) fn update(
-        target_table: TableReference,
+        target_table: ResolvedTableReference,
         update_schema: SchemaRef,
     ) -> Result<Self, DataFusionError> {
         let (filters, updates) = update_schema

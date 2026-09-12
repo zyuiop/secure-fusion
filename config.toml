@@ -1,0 +1,14 @@
+[backend_config]
+encrypt_by_default = true
+normalize_identifiers = false
+mysql_connect_string = "mysql://user:password@host:3306/"
+row_binding_aad = false
+
+[backend_config.metadata_store.Disk]
+path = "."
+
+[crypto_config]
+secret_key = "b6fd00728958b706fde7f9d5fde9637a5feadab81688b480ae66dcc3393f1284"
+
+[crypto_config.backend]
+Aws = "Aes128Gcm"

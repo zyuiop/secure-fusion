@@ -22,6 +22,23 @@ pub fn object_name_from_resolved(table_ref: &ResolvedTableReference) -> ObjectNa
     ObjectName::from(table_parts)
 }
 
+#[allow(dead_code, unused)]
+pub fn object_name_from_reference(table_ref: &TableReference) -> ObjectName {
+    let table_parts = match table_ref {
+        TableReference::Bare { table } => {
+            vec![quote_ident(table.to_string())]
+        }
+        TableReference::Partial { schema, table } | TableReference::Full { schema, table, .. } => {
+            vec![
+                quote_ident(schema.to_string()),
+                quote_ident(table.to_string()),
+            ]
+        }
+    };
+
+    ObjectName::from(table_parts)
+}
+
 pub fn object_name_matches_resolved(
     object_name: &ObjectName,
     table_ref: &ResolvedTableReference,

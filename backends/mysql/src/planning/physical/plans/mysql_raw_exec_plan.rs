@@ -19,7 +19,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub(crate) struct MySqlRawExecPlan {
     query: ast::Statement,
-    props: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for MySqlRawExecPlan {
@@ -33,12 +33,12 @@ impl MySqlRawExecPlan {
         let project_schema = Arc::clone(&DML_SCHEMA);
         Self {
             query: stmt,
-            props: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 }
@@ -53,11 +53,11 @@ impl ExecutionPlan for MySqlRawExecPlan {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.props.eq_properties.schema().clone()
+        self.properties.eq_properties.schema().clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
-        &self.props
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

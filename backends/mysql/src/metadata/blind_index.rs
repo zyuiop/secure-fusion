@@ -1,23 +1,32 @@
-use crate::metadata::indices::{expr_to_column, expr_to_value};
+use crate::ast_expr_ext::AstExprExt;
+use crate::filtering::indexable_filter::{
+    ColumnOrTuple, EqualityOperator, IndexSelectivity, IndexableFilterExpr, SupportOptions,
+};
+use crate::filtering::logical::IndexableLogicalExpr;
+use crate::filtering::physical::IndexablePhysicalExpr;
 use crate::metadata::{
     ColumnName, EncryptedIndex, EncryptedIndexConfigurationVariant, IndexConfig,
     IndexInsertStrategy, IndexQueryStrategy,
 };
-use crate::planning::physical::plans::create_blind_index_plan::CreateBlindIndexPlan;
-use crate::providers::table_provider::{IndexableColumn, MySqlTableProvider};
+use crate::planning::physical::plans::create_columnar_index_plan::CreateColumnarIndexPlan;
+use crate::providers::table_provider::{MySqlTableProvider, TableStatistics};
 use async_trait::async_trait;
 use crypto::identifiers::StableIdentifiersGenerator;
-use crypto::key_manager::KeyManager;
+use crypto::planning::physical::to_binary::ToBinaryExpr;
+use crypto::row_id::RowIdColumn;
 use crypto::{IdentifierContext, LongTermKeyManager};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, GenericByteArray, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, GenericBinaryType, Schema, SchemaRef};
-use datafusion::common::{Column, ResolvedTableReference, ScalarValue, TableReference};
+use datafusion::common::{ResolvedTableReference, ScalarValue, plan_err};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
-use datafusion::logical_expr::{BinaryExpr, ColumnarValue, Expr, Operator};
+use datafusion::logical_expr::sqlparser::ast::BinaryOperator;
+use datafusion::logical_expr::{ColumnarValue, Expr};
 use datafusion::physical_expr;
 use datafusion::physical_plan::projection::ProjectionExpr;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
+use datafusion::sql::sqlparser::ast;
+use datafusion::sql::sqlparser::ast::Ident;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -37,8 +46,8 @@ pub struct BlindIndexConfig {
 impl IndexConfig for BlindIndexConfig {
     fn into_index(
         self,
-        _table_name: &str,
-        _indexable_column: IndexableColumn,
+        _table_name: &ResolvedTableReference,
+        _indexable_column: Option<&RowIdColumn>,
     ) -> Arc<dyn EncryptedIndex> {
         Arc::new(BlindIndex::new(
             self.index_name,
@@ -50,22 +59,24 @@ impl IndexConfig for BlindIndexConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlindIndex {
-    pub name: String,
-    pub column: ColumnName,
+    pub name: Arc<str>,
+    pub indexed_column: Arc<str>,
     pub size_bits: usize,
-    pub index_column_name: String,
+    pub index_column_name: Arc<str>,
 }
 
 impl BlindIndex {
+    #[inline(always)]
     fn scalar_to_bytes(scalar_value: &ScalarValue) -> Vec<u8> {
         // TODO: we must use the same strategy to cast as when inserting values
         scalar_value.to_string().into_bytes()
     }
 
-    fn identifier_context<'a>(&'a self, table: &'a TableReference) -> IdentifierContext<'a> {
+    #[inline(always)]
+    fn identifier_context(&self, table: &ResolvedTableReference) -> IdentifierContext {
         IdentifierContext::NamedIndexInTable {
-            table: table.table(),
-            index_name: &self.name,
+            table_context: table.clone(),
+            index_name: Arc::clone(&self.name),
         }
     }
 
@@ -74,129 +85,189 @@ impl BlindIndex {
         index_column_name.truncate(32);
 
         Self {
-            name,
-            column,
+            name: name.into(),
+            indexed_column: column.into(),
             size_bits,
-            index_column_name,
+            index_column_name: index_column_name.into(),
         }
     }
 
-    fn apply_for_expr(
+    fn value_to_blind_value(
         &self,
-        table_ref: &TableReference,
-        key_manager: Arc<LongTermKeyManager>,
-        expr: &BinaryExpr,
-    ) -> Option<Expr> {
-        let column =
-            expr_to_column(table_ref, &expr.left).or(expr_to_column(table_ref, &expr.left))?;
-        let value = expr_to_value(&expr.left).or(expr_to_value(&expr.right))?;
-
-        if column.name != self.column {
-            return None;
-        }
-
-        let blind_index_gen =
-            key_manager.get_identifier_generator(&self.identifier_context(table_ref));
-        let bi_value = blind_index_gen
-            .get_opaque_stable_identifier_hex(&Self::scalar_to_bytes(value), self.size_bits);
-
-        Some(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::Literal(ScalarValue::Utf8(Some(bi_value)), None)),
-            expr.op,
-            Box::new(Expr::Column(Column::new(
-                Some(table_ref.clone()),
-                self.index_column_name.clone(),
-            ))),
-        )))
+        generator: &dyn StableIdentifiersGenerator,
+        value: &ScalarValue,
+    ) -> ast::Expr {
+        ast::Expr::Value(
+            ast::Value::SingleQuotedString(
+                generator.get_opaque_stable_identifier_hex(
+                    &Self::scalar_to_bytes(&value),
+                    self.size_bits,
+                ),
+            )
+            .into(),
+        )
     }
 
-    fn apply_for_query(
+    fn is_indexable_expr_supported<E>(
         &self,
-        table_ref: &TableReference,
-        key_manager: Arc<LongTermKeyManager>,
-        filter: &Expr,
-    ) -> Option<Expr> {
-        if let Expr::Alias(alias) = filter {
-            return self.apply_for_query(table_ref, key_manager, alias.expr.as_ref());
+        logical: &IndexableFilterExpr<E>,
+        table_rows: &TableStatistics,
+    ) -> Option<IndexSelectivity> {
+        match logical {
+            IndexableFilterExpr::Eq(c, EqualityOperator::Eq, _)
+            | IndexableFilterExpr::InList(ColumnOrTuple::Column(c), _)
+                if c.column.name == self.indexed_column.as_ref() =>
+            {
+                if let Some(selectivity) =
+                    table_rows.column_selectivity(self.index_column_name.as_ref())
+                {
+                    return Some(
+                        table_rows
+                            .num_rows()
+                            .with_estimated_selectivity(selectivity),
+                    );
+                }
+
+                // Assume uniform
+                let possible_values = 1u32 << self.size_bits;
+                Some(
+                    table_rows
+                        .num_rows()
+                        .with_estimated_selectivity(1f64 / (possible_values as f64)),
+                )
+            }
+            _ => None,
         }
+    }
 
-        let Expr::BinaryExpr(binary_expr) = filter else {
-            return None;
-        };
+    fn indexable_query_to_expr<T: Debug + Clone>(
+        &self,
+        filter: IndexableFilterExpr<T>,
+        table_reference: &ResolvedTableReference,
+        key_manager: &Arc<LongTermKeyManager>,
+    ) -> datafusion::common::Result<ast::Expr> {
+        match filter {
+            IndexableFilterExpr::<T>::And(l, r) => Ok(self
+                .indexable_query_to_expr(*l, table_reference, key_manager)?
+                .and(self.indexable_query_to_expr(*r, table_reference, key_manager)?)),
+            IndexableFilterExpr::<T>::Or(l, r) => Ok(self
+                .indexable_query_to_expr(*l, table_reference, key_manager)?
+                .or(self.indexable_query_to_expr(*r, table_reference, key_manager)?)),
+            IndexableFilterExpr::<T>::InList(ColumnOrTuple::Column(col), values) => {
+                if col.column.name != self.indexed_column.as_ref() {
+                    plan_err!("unsupported column for blind_index: {}", col.column.name)?;
+                }
 
-        if binary_expr.op == Operator::Or || binary_expr.op == Operator::And {
-            // Try both
-            let left = self.apply_for_query(table_ref, key_manager.clone(), &binary_expr.left);
-            let right = self.apply_for_query(table_ref, key_manager, &binary_expr.right);
+                let blind_index_gen =
+                    key_manager.get_identifier_generator(&self.identifier_context(table_reference));
+                let bi_values = values
+                    .iter()
+                    .map(|value| self.value_to_blind_value(blind_index_gen.as_ref(), value))
+                    .collect::<Vec<_>>();
 
-            return match (left, right) {
-                (None, None) => None,
-                (Some(left), None) => Some(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(left),
-                    binary_expr.op,
-                    binary_expr.right.clone(),
-                ))),
-                (None, Some(right)) => Some(Expr::BinaryExpr(BinaryExpr::new(
-                    binary_expr.right.clone(),
-                    binary_expr.op,
-                    Box::new(right),
-                ))),
-                (Some(left), Some(right)) => Some(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(left),
-                    binary_expr.op,
-                    Box::new(right),
-                ))),
-            };
+                Ok(ast::Expr::InList {
+                    expr: Box::new(ast::Expr::CompoundIdentifier(vec![
+                        Ident::new(table_reference.table.as_ref()),
+                        Ident::new(self.index_column_name.as_ref()),
+                    ])),
+                    list: bi_values,
+                    negated: false,
+                })
+            }
+            IndexableFilterExpr::<T>::Eq(col, EqualityOperator::Eq, value) => {
+                if col.column.name != self.indexed_column.as_ref() {
+                    plan_err!("unsupported column for blind_index: {}", col.column.name)?;
+                }
+
+                let blind_index_gen =
+                    key_manager.get_identifier_generator(&self.identifier_context(table_reference));
+                let bi_value = self.value_to_blind_value(blind_index_gen.as_ref(), &value);
+
+                Ok(ast::Expr::BinaryOp {
+                    left: Box::new(ast::Expr::CompoundIdentifier(vec![
+                        Ident::new(table_reference.table.as_ref()),
+                        Ident::new(self.index_column_name.as_ref()),
+                    ])),
+                    right: Box::new(bi_value),
+                    op: BinaryOperator::Eq,
+                })
+            }
+            other => plan_err!("unsupported filter for blind_index: {other:?}"),
         }
-
-        if binary_expr.op != Operator::Eq {
-            return None;
-        }
-
-        self.apply_for_expr(table_ref, key_manager, &binary_expr)
     }
 }
 
 #[async_trait]
 impl EncryptedIndex for BlindIndex {
-    fn supports_expression(&self, filter: &Expr) -> bool {
-        if let Expr::Alias(alias) = filter {
-            return self.supports_expression(alias.expr.as_ref());
+    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn tracked_columns(&self) -> FxHashSet<ColumnName> {
+        let mut columns = FxHashSet::with_capacity_and_hasher(1, FxBuildHasher::default());
+        columns.insert(self.indexed_column.as_ref().into());
+        columns
+    }
+
+    fn logical_support_options<'s, 'b>(&'s self) -> SupportOptions<'s, &'b Expr> {
+        SupportOptions {
+            supports_not: false,
+            supports_or: true,
+            is_supported: Box::new(|v, s| self.is_indexable_expr_supported(v, s)),
         }
+    }
 
-        let Expr::BinaryExpr(binary_expr) = filter else {
-            return false;
-        };
+    fn logical_query(
+        self: Arc<Self>,
+        table_reference: &ResolvedTableReference,
+        _indexable_column: Option<&RowIdColumn>,
+        key_manager: &Arc<LongTermKeyManager>,
+        filter: IndexableLogicalExpr,
+    ) -> datafusion::common::Result<IndexQueryStrategy> {
+        Ok(IndexQueryStrategy::Fixed(self.indexable_query_to_expr(
+            filter,
+            table_reference,
+            key_manager,
+        )?))
+    }
 
-        if binary_expr.op == Operator::Or || binary_expr.op == Operator::And {
-            return self.supports_expression(&binary_expr.left)
-                || self.supports_expression(&binary_expr.right);
-        }
+    fn physical_support_options<'s, 'b>(
+        &'s self,
+    ) -> Option<SupportOptions<'s, &'b dyn PhysicalExpr>> {
+        Some(SupportOptions {
+            supports_not: false,
+            supports_or: true,
+            is_supported: Box::new(|v, s| self.is_indexable_expr_supported(v, s)),
+        })
+    }
 
-        if binary_expr.op != Operator::Eq {
-            return false;
-        }
-
-        let Some(col) = binary_expr
-            .left
-            .try_as_col()
-            .or(binary_expr.right.try_as_col())
-        else {
-            return false;
-        };
-        let Some(_) = binary_expr
-            .left
-            .as_literal()
-            .or(binary_expr.right.as_literal())
-        else {
-            return false;
-        };
-
-        col.name == self.column
+    fn physical_query(
+        self: Arc<Self>,
+        table_reference: &ResolvedTableReference,
+        _indexable_column: Option<&RowIdColumn>,
+        key_manager: &Arc<LongTermKeyManager>,
+        filter: IndexablePhysicalExpr,
+    ) -> datafusion::common::Result<IndexQueryStrategy> {
+        Ok(IndexQueryStrategy::Fixed(self.indexable_query_to_expr(
+            filter,
+            table_reference,
+            key_manager,
+        )?))
     }
 
     fn requires_external_storage(&self) -> bool {
         false
+    }
+
+    async fn create_index_plan(
+        self: Arc<Self>,
+        parent_table_ref: &ResolvedTableReference,
+        session_state: &SessionState,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let plan =
+            CreateColumnarIndexPlan::blind_index(parent_table_ref, session_state, self).await?;
+
+        Ok(Arc::new(plan))
     }
 
     fn insert(
@@ -205,94 +276,40 @@ impl EncryptedIndex for BlindIndex {
         key_manager: Arc<LongTermKeyManager>,
         schema: SchemaRef,
     ) -> datafusion::common::Result<IndexInsertStrategy> {
-        if schema.column_with_name(&self.column).is_none() {
+        if schema.column_with_name(&self.indexed_column).is_none() {
             // Tracked column is absent, do nothing
             return Ok(IndexInsertStrategy::AddColumns(vec![]));
         }
 
         let blind_index_gen =
-            key_manager.get_identifier_generator(&self.identifier_context(&table.table_reference));
+            key_manager.get_identifier_generator(&self.identifier_context(table.table_reference()));
 
         let sink = BlindIndexExpr {
-            source_column: Arc::new(physical_expr::expressions::Column::new_with_schema(
-                &self.column,
-                schema.as_ref(),
-            )?),
+            source_column: Arc::new(ToBinaryExpr::new(Arc::new(
+                physical_expr::expressions::Column::new_with_schema(
+                    &self.indexed_column,
+                    schema.as_ref(),
+                )?,
+            ))),
             size_bits: self.size_bits,
             generator: blind_index_gen.into(),
         };
 
-        let project = ProjectionExpr::new(Arc::new(sink), self.index_column_name.clone());
+        let project = ProjectionExpr::new(Arc::new(sink), self.index_column_name.as_ref());
 
         Ok(IndexInsertStrategy::AddColumns(vec![project]))
     }
 
-    fn query(
-        self: Arc<Self>,
-        table_ref: &MySqlTableProvider,
-        key_manager: Arc<LongTermKeyManager>,
-        filter: &[Expr],
-    ) -> datafusion::common::Result<Option<IndexQueryStrategy>> {
-        let Some(expr) = filter
-            .into_iter()
-            .map(|expr| {
-                self.apply_for_query(&table_ref.table_reference, key_manager.clone(), &expr)
-            })
-            .reduce(|left, right| {
-                if left.is_none() {
-                    return right;
-                }
-
-                if right.is_none() {
-                    return left;
-                }
-
-                Some(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(left.unwrap()),
-                    Operator::And,
-                    Box::new(right.unwrap()),
-                )))
-            })
-            .flatten()
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(IndexQueryStrategy::AddFilterExpression(expr)))
-    }
-
     fn is_column_hidden(&self, column: &ColumnName) -> bool {
-        column == &self.index_column_name
+        column == self.index_column_name.as_ref()
     }
 
     fn to_config(&self) -> EncryptedIndexConfigurationVariant {
         EncryptedIndexConfigurationVariant::BlindIndex(BlindIndexConfig {
-            index_name: self.name.clone(),
-            column: self.column.clone(),
+            index_name: self.name.as_ref().into(),
+            column: self.indexed_column.as_ref().into(),
             size_bits: self.size_bits,
         })
-    }
-
-    fn tracked_columns(&self) -> FxHashSet<ColumnName> {
-        let mut columns = FxHashSet::with_capacity_and_hasher(1, FxBuildHasher::default());
-        columns.insert(self.column.clone());
-        columns
-    }
-
-    async fn create_index_plan(
-        &self,
-        parent_table_ref: ResolvedTableReference,
-        session_state: &SessionState,
-    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        let plan =
-            CreateBlindIndexPlan::new(parent_table_ref, session_state, Arc::new(self.clone()))
-                .await;
-
-        Ok(Arc::new(plan))
-    }
-
-    fn linked_table_names(&self) -> Vec<String> {
-        vec![]
     }
 }
 
@@ -394,6 +411,8 @@ impl PhysicalExpr for BlindIndexExpr {
     }
 
     fn fmt_sql(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        _f.write_str("blind_index(")?;
+        self.source_column.fmt_sql(_f)?;
+        _f.write_str(")")
     }
 }

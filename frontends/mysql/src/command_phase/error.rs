@@ -6,6 +6,7 @@ use mysql_common::proto::codec::error::PacketCodecError;
 use mysql_interop::constants::CommandId;
 use mysql_interop::sql_error::SqlError;
 use num_enum::TryFromPrimitiveError;
+use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]
 pub enum CommandPhaseError {
@@ -18,6 +19,40 @@ pub enum CommandPhaseError {
     UnhandledCommand(CommandId),
     ParserError(ParseError),
     OtherError(String),
+}
+
+impl Display for CommandPhaseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandPhaseError::IoError(err) => {
+                write!(f, "IO error: {}", err)
+            }
+            CommandPhaseError::PacketCodecError(err) => {
+                write!(f, "Packet codec error: {}", err)
+            }
+            CommandPhaseError::SqlError(err) => {
+                write!(f, "SQL error: {:?}", err)
+            }
+            CommandPhaseError::DataFusionError(err) => {
+                write!(f, "DataFusion error: {}", err)
+            }
+            CommandPhaseError::UnknownCommandId(err) => {
+                write!(f, "Unknown Command 0x{err:x}")
+            }
+            CommandPhaseError::UnknownStatement(err) => {
+                write!(f, "Unknown Statement ID 0x{err:x}")
+            }
+            CommandPhaseError::UnhandledCommand(err) => {
+                write!(f, "Unsupported Command {err:?}")
+            }
+            CommandPhaseError::ParserError(err) => {
+                write!(f, "Parse error: {:?}", err)
+            }
+            CommandPhaseError::OtherError(err) => {
+                write!(f, "Unknown error: {err}")
+            }
+        }
+    }
 }
 
 impl From<std::io::Error> for CommandPhaseError {

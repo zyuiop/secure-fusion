@@ -38,8 +38,7 @@ use std::sync::Arc;
 
 /// Represents a "frontend" to the proxy, that is an entry point via which clients connect to it
 pub trait Frontend {
-    #[allow(async_fn_in_trait)]
-    async fn start_listening(self) -> !;
+    fn start_listening(self) -> !;
 }
 
 #[async_trait]

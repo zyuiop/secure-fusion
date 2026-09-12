@@ -1,12 +1,12 @@
 use datafusion::error::DataFusionError;
-use rand_core::OsError;
-use sha2::digest::crypto_common::getrandom;
+use hkdf::InvalidLength;
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]
 pub enum CryptoError {
     CipherError,
     OsError,
+    InvalidLength,
 }
 
 impl From<aead::Error> for CryptoError {
@@ -15,15 +15,9 @@ impl From<aead::Error> for CryptoError {
     }
 }
 
-impl From<getrandom::Error> for CryptoError {
-    fn from(_value: getrandom::Error) -> Self {
-        CryptoError::CipherError
-    }
-}
-
-impl From<OsError> for CryptoError {
-    fn from(_value: OsError) -> Self {
-        CryptoError::OsError
+impl From<InvalidLength> for CryptoError {
+    fn from(_: InvalidLength) -> Self {
+        CryptoError::InvalidLength
     }
 }
 

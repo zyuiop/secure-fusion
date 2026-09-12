@@ -3,7 +3,7 @@ use crate::backend_config::BackendConfig;
 use crate::metadata::{EncryptedTableMeta, SerializableEncryptedTableMeta};
 use crate::providers::build_primary_key;
 use crate::providers::catalog_provider::MySqlCatalogProvider;
-use crate::providers::table_provider::MySqlTableProvider;
+use crate::providers::table_provider::{MySqlTableProvider, TableStatistics};
 use crate::store::StoreGetter;
 use datafusion::common::ResolvedTableReference;
 use datafusion::error::DataFusionError;
@@ -38,7 +38,8 @@ impl CreateTablePlan {
             table_reference.clone().into(),
             table.columns.clone(),
             primary_key.clone(),
-            encrypted_meta,
+            Some(encrypted_meta),
+            TableStatistics::for_empty_table(table_reference.clone().into()),
         );
 
         let serializable_metadata: SerializableEncryptedTableMeta =

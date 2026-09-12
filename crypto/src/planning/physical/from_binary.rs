@@ -1,7 +1,7 @@
-use crate::arrow::cast_from_binary;
-use datafusion::arrow::array::{AsArray, RecordBatch};
+use crate::arrow::decode_columnar_value_from_binary;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Schema};
-use datafusion::common::{DataFusionError, ScalarValue, exec_err};
+use datafusion::common::{DataFusionError, exec_err};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::logical_expr::interval_arithmetic::Interval;
 use datafusion::logical_expr::statistics::Distribution;
@@ -79,18 +79,7 @@ impl PhysicalExpr for FromBinaryExpr {
             return Ok(parent);
         }
 
-        match parent {
-            ColumnarValue::Array(array) => {
-                let column = cast_from_binary(array.as_binary(), &self.target_type)?;
-                Ok(ColumnarValue::Array(column))
-            }
-            ColumnarValue::Scalar(scalar) => {
-                let array = scalar.to_array()?;
-                let column = cast_from_binary(array.as_binary(), &self.target_type)?;
-                let scalar = ScalarValue::try_from_array(&column, 0)?;
-                Ok(ColumnarValue::Scalar(scalar))
-            }
-        }
+        decode_columnar_value_from_binary(parent, &self.target_type)
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {

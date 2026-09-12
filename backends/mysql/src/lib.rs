@@ -1,10 +1,11 @@
 #![deny(
-    unused_must_use,
     unreachable_code,
     unreachable_patterns,
-    unused_imports,
     dead_code,
     irrefutable_let_patterns,
+    unused,
+    unused_must_use,
+    unused_imports,
     unused_unsafe,
     unused_mut,
     unused_variables
@@ -21,6 +22,8 @@ use async_trait::async_trait;
 use common::extensions::variable_store::VariableStoreExtension;
 use common::{Backend, BackendWrappedSession, LogicalPrePlanner};
 use datafusion::catalog::{CatalogProvider, CatalogProviderList};
+use datafusion::common::utils::get_available_parallelism;
+use datafusion::config::Dialect;
 use datafusion::execution::{SessionState, SessionStateBuilder, TaskContext};
 use datafusion::optimizer::{Analyzer, Optimizer};
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
@@ -48,8 +51,10 @@ mod variables;
 
 #[cfg(not(feature = "old-scan-converter"))]
 mod arrow_helper;
+pub mod ast_expr_ext;
 mod backend_config;
 mod expr_util;
+pub mod filtering;
 mod udf;
 
 use crate::backend_config::BackendConfig;
@@ -61,6 +66,8 @@ use crate::udf::{expr_planners, register_aggregates, register_udfs, register_udf
 pub use metadata::store;
 
 pub use backend_config::BackendConfig as MySqlBackendConfig;
+
+pub use providers::table_provider::MySqlTableProvider;
 
 const DEFAULT_CATALOG: &str = "def";
 
@@ -118,9 +125,13 @@ impl MySqlBackend {
         let conn = config.get_conn().await?;
         let metadata_store = MetadataStore::from(&config.metadata_store);
 
-        let catalog_provider =
-            MySqlCatalogProvider::introspect(conn, &metadata_store, config.normalize_identifiers)
-                .await?;
+        let catalog_provider = MySqlCatalogProvider::introspect(
+            "def",
+            conn,
+            &metadata_store,
+            config.normalize_identifiers,
+        )
+        .await?;
 
         // TODO: obtain list of variables?
         // TODO: obtain list of functions?
@@ -244,10 +255,54 @@ impl Backend for MySqlBackend {
             .with_extension(connection)
             .with_extension(Arc::new(TransactionControl::default()))
             .with_extension(variable_store.clone())
+            .with_extension(self.catalog_provider.clone())
             .with_extension(self.backend_config.clone());
 
         config.options_mut().sql_parser.enable_ident_normalization =
             self.backend_config.normalize_identifiers;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_inlist_pushdown_max_distinct_values = self
+            .backend_config
+            .df_hash_join_max_pushdown_values
+            .unwrap_or(128 * 1024); // More than this and the query starts getting too big for MySQL
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_inlist_pushdown_max_size = config
+            .options_mut()
+            .optimizer
+            .hash_join_inlist_pushdown_max_distinct_values
+            * self
+                .backend_config
+                .df_hash_join_max_pushdown_size_per_value
+                .unwrap_or(1024); // 128 MiB (1 KB per value)
+
+        config.options_mut().optimizer.repartition_joins =
+            self.backend_config.df_repartition_joins.unwrap_or(false);
+        config
+            .options_mut()
+            .optimizer
+            // default 20. disables assumptions on filter selectivity, which may lead to double-count filters that were pushed down.
+            // an alternative is to __do nothing__ on the indices and let datafusion figure it out...
+            // interestingly, the only columns for which datafusion has no useful selectivity info seem to be the encrypted columns
+            .default_filter_selectivity = self
+            .backend_config
+            .df_default_filter_selectivity
+            .unwrap_or(100);
+        config.options_mut().execution.target_partitions = self
+            .backend_config
+            .df_target_parallelism
+            .unwrap_or_else(|| get_available_parallelism()); // reduce target number of partitions
+
+        // Try to see if it's faster with smaller batches?
+        config.options_mut().execution.batch_size =
+            self.backend_config.df_batch_size.unwrap_or(8192);
+
+        config.options_mut().sql_parser.dialect = Dialect::MySQL;
+        config.options_mut().format.timestamp_format = Some("%Y-%m-%d %H:%M:%S".to_string());
+        config.options_mut().format.datetime_format = Some("%Y-%m-%d %H:%M:%S".to_string());
         config
             .options_mut()
             .execution
@@ -256,8 +311,12 @@ impl Backend for MySqlBackend {
             .options_mut()
             .execution
             .skip_physical_aggregate_schema_check = true;
-        config.options_mut().execution.target_partitions = 1;
-        config.options_mut().execution.batch_size = 4000; // Try to see if it's faster with smaller batches?
+
+        // Does not work in our MySQL Scan node, as it expects pushdown to be over before querying
+        config
+            .options_mut()
+            .optimizer
+            .enable_topk_dynamic_filter_pushdown = false;
 
         let mut ssb = SessionStateBuilder::new()
             .with_config(config)
@@ -299,7 +358,9 @@ impl Backend for MySqlBackend {
     fn add_physical_optimizer_rules(&self, optimizer_rules: &mut PhysicalOptimizer) {
         optimizer_rules
             .rules
-            .extend_from_slice(&planning::physical::get_optimizers());
+            .extend_from_slice(&planning::physical::get_optimizers(Arc::clone(
+                &self.catalog_provider.inner,
+            )));
     }
 
     fn add_optimizer_rules(&self, optimizer_rules: &mut Optimizer) {

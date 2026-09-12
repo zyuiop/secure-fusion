@@ -102,11 +102,12 @@ pub(crate) fn query_arrow(
         let mut conn = conn.try_lock().unwrap();
 
         // DEBATABLE: should we use text or binary protocol here? (benchmark!)
-        let mut iterator = conn
-            .query_stream::<Row, _>(query)
-            .await
-            .map_err(|err| DataFusionError::External(Box::new(err)))?;
+        let stream = conn.query_stream::<Row, _>(query);
 
+        #[cfg(feature = "tracing")]
+        let stream = tracing::instrument::Instrument::instrument(stream, tracing::info_span!("mysql_query_time"));
+
+        let mut iterator = stream.await.map_err(|err| DataFusionError::External(Box::new(err)))?;
         let mut current_builders: Option<Vec<Box<dyn ArrayBuilder>>> = None;
 
         let mut mysql_types: Vec<ColumnType> = Vec::new();

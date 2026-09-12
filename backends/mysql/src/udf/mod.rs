@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 mod bitwise_not;
 mod database;
-pub(crate) mod exists;
 mod func_if;
 mod group_concat;
 mod length;

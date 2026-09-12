@@ -17,19 +17,19 @@ impl TransactionControl {
         let schema_ref = Arc::clone(&DML_SCHEMA);
         Arc::new(TransactionControlPlan {
             inner: self,
-            props: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema_ref),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 }
 
 #[derive(Debug)]
 pub struct TransactionControlPlan {
-    props: PlanProperties,
+    properties: Arc<PlanProperties>,
     inner: TransactionControl,
 }
 
@@ -48,8 +48,8 @@ impl ExecutionPlan for TransactionControlPlan {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
-        &self.props
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

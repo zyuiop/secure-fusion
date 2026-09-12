@@ -1,5 +1,6 @@
 pub mod alter_table_plan;
-pub mod create_blind_index_plan;
+pub mod create_columnar_index_plan;
+pub mod create_rowid_plan;
 pub mod create_schema_plan;
 pub mod create_table_plan;
 mod ddl_physical_plan;

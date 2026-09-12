@@ -31,7 +31,7 @@ pub struct MySqlDmlSink {
     pub(super) report_last_insert: bool,
 }
 
-#[cfg(feature = "log-outgoing-queries")]
+#[cfg(feature = "log-dml-queries")]
 macro_rules! build_log_outgoing_values {
     ($mapped: expr, $expected_schema: expr) => {{
         use mysql_common::params::Params;
@@ -68,7 +68,7 @@ macro_rules! build_log_outgoing_values {
     }};
 }
 
-#[cfg(not(feature = "log-outgoing-queries"))]
+#[cfg(not(feature = "log-dml-queries"))]
 macro_rules! build_log_outgoing_values {
     ($mapped: expr, $_: expr) => {
         $mapped
@@ -108,7 +108,11 @@ impl RecordBatchSink for MySqlDmlSink {
         let mut num_inserted = 0u64;
         for batch in data.into_iter() {
             if batch.schema() != self.expected_input_schema {
-                exec_err!("Batch schema differs from expected input schema")?;
+                exec_err!(
+                    "Batch schema differs from expected input schema. Expected: {}, got: {}",
+                    self.expected_input_schema,
+                    batch.schema()
+                )?;
             }
 
             num_inserted += batch.num_rows() as u64;

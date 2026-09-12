@@ -1,3 +1,4 @@
+use crypto::planning::physical::decrypt::DecryptUdf;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Column, ScalarValue, plan_err};
 use datafusion::error::DataFusionError;
@@ -113,9 +114,14 @@ impl KwSearchUdf {
         let search_columns: Vec<_> = columns
             .iter()
             .map(|expr| {
-                expr.try_as_col().cloned().ok_or_else(|| {
-                    DataFusionError::Plan("KW_SEARCH first arguments must be columns".to_string())
-                })
+                DecryptUdf::eliminate_decrypt_in_expr(expr)?
+                    .try_as_col()
+                    .cloned()
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "KW_SEARCH first arguments must be columns".to_string(),
+                        )
+                    })
             })
             .collect::<Result<_, _>>()?;
 

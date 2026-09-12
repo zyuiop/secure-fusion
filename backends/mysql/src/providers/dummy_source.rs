@@ -8,6 +8,12 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+/// A dummy table, used for queries in the form `SELECT 1 FROM dual`.
+///
+/// This is used when computation is done in the projection phase but no actual source is selected.
+/// It should be removed by an analyzer step during logical planning, any call to `scan` is therefore a mistake.
+///
+/// See [https://en.wikipedia.org/wiki/DUAL_table]
 #[derive(Debug)]
 pub struct DummySource {
     schema: SchemaRef,

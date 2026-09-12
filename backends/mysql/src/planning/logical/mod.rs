@@ -14,7 +14,6 @@ mod update;
 pub use insert::DUPLICATE_VALUE_PFX;
 pub use update::{CURRENT_VALUE_PREFIX, FILTER_PREFIX};
 
-use crate::get_catalog::CatalogGetter;
 use crate::metadata::kw_search_func::rewrite_kw_search;
 use crate::planning::logical::custom_ddl::{CustomDdlLogicalPlan, DdlOperation};
 use crate::planning::logical::custom_forward_statement::ForwardStatement;
@@ -27,10 +26,12 @@ use common::{HandlerResult, LogicalPrePlanner, default_statement_to_plan};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, plan_err};
 use datafusion::execution::SessionState;
-use datafusion::logical_expr::sqlparser::ast::{Expr, ObjectName, ObjectType, Statement, Value};
+use datafusion::logical_expr::sqlparser::ast::{
+    AlterTable, Expr, ObjectName, ObjectType, Statement, Value,
+};
 use datafusion::logical_expr::{EmptyRelation, Extension, LogicalPlan};
 use datafusion::optimizer::OptimizerConfig;
-use datafusion::sql::sqlparser::ast::{Ident, LockTable, Set, TransactionMode, VisitMut};
+use datafusion::sql::sqlparser::ast::{Set, TransactionMode, VisitMut};
 use std::sync::Arc;
 
 pub struct MySqlLogicalPlanner;
@@ -78,12 +79,12 @@ impl LogicalPrePlanner for MySqlLogicalPlanner {
                             Box::new(ct),
                         )))
                     }
-                    Statement::AlterTable {
+                    Statement::AlterTable(AlterTable {
                         if_exists,
                         name,
                         operations,
                         ..
-                    } => {
+                    }) => {
                         let table = unparser::table_name_to_ref(&name);
                         let table = table.resolve(
                             &session_state.options().catalog.default_catalog,
@@ -107,52 +108,13 @@ impl LogicalPrePlanner for MySqlLogicalPlanner {
                         },
                     )),
                     Statement::LockTables { tables } => {
-                        // Remap lock tables (TODO)
-                        let tables = tables.into_iter().flat_map(
-                            |LockTable {
-                                 table,
-                                 lock_type,
-                                 alias,
-                             }| {
-                                let resolved_table = session_state
-                                    .get_catalog()
-                                    .mysql_schema(session_state.default_schema())
-                                    .and_then(|schema| schema.mysql_table(&table.value));
+                        // INFO: There used to be some code here that extended the LockTables to
+                        // include index tables linked to the requested tables.
+                        // This seems un-necessary actually, as if the table is locked, we cannot
+                        // touch it and therefore cannot touch the index table either.
 
-                                match resolved_table {
-                                    None => {
-                                        // Weird, the table should exist, but forward as is...
-                                        vec![LockTable {
-                                            table,
-                                            lock_type,
-                                            alias,
-                                        }]
-                                    }
-                                    Some(tbl) => {
-                                        let mut output = tbl
-                                            .linked_table_names()
-                                            .into_iter()
-                                            .map(|other_table| LockTable {
-                                                table: Ident::new(other_table),
-                                                lock_type: lock_type.clone(),
-                                                alias: alias.clone(),
-                                            })
-                                            .collect::<Vec<_>>();
-
-                                        output.push(LockTable {
-                                            table,
-                                            lock_type,
-                                            alias,
-                                        });
-                                        output
-                                    }
-                                }
-                            },
-                        );
                         Ok(ForwardStatement::new_with_dml_schema(
-                            Statement::LockTables {
-                                tables: tables.collect(),
-                            },
+                            Statement::LockTables { tables },
                         ))
                     }
                     s @ Statement::UnlockTables => Ok(ForwardStatement::new_with_dml_schema(s)),
